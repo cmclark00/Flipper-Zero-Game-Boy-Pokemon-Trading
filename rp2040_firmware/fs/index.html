@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RP2040 Pokemon Link</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>RP2040 Pokemon Link</h1>
+
+    <div id="status-section">
+        GameBoy Status: <span id="gb-status">Unknown</span>
+    </div>
+
+    <div id="stored-pokemon-section">
+        <h2>Stored Pokemon:</h2>
+        <ul id="pokemon-list">
+            <!-- List items will be populated by script.js -->
+        </ul>
+    </div>
+
+    <div id="trade-controls-section">
+        <h2>Trade Controls:</h2>
+        <p>Selected Pokemon for Trade: <span id="selected-pokemon-trade">None</span></p>
+        <button id="initiate-trade-btn">Initiate Trade with GameBoy</button>
+    </div>
+
+    <div id="log-section">
+        <h2>Log:</h2>
+        <pre id="log-output"></pre>
+    </div>
+
+    <script src="script.js" defer></script>
+</body>
+</html>
