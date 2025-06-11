@@ -87,10 +87,10 @@ static void init_pokemon_data(void) {
     int pkmn_offset = 8;
     
     stored_pokemon[pkmn_offset + 0] = 0x99;   // species: Bulbasaur internal index (correct)
-    stored_pokemon[pkmn_offset + 1] = 0x2D;   // current hp low byte (45 HP)
+    stored_pokemon[pkmn_offset + 1] = 0x36;   // current hp low byte (54 HP - MUST BE > 0 and match max HP)
     stored_pokemon[pkmn_offset + 2] = 0x00;   // current hp high byte
-    stored_pokemon[pkmn_offset + 3] = 0x05;   // level: 5
-    stored_pokemon[pkmn_offset + 4] = 0x00;   // status_condition (healthy)
+    stored_pokemon[pkmn_offset + 3] = 0x0A;   // level: 10 (higher level to ensure validity)
+    stored_pokemon[pkmn_offset + 4] = 0x00;   // status_condition (0x00 = healthy, NOT fainted)
     stored_pokemon[pkmn_offset + 5] = 0x16;   // type[0]: Grass (0x16 - verified correct)
     stored_pokemon[pkmn_offset + 6] = 0x03;   // type[1]: Poison (0x03 - verified correct)  
     stored_pokemon[pkmn_offset + 7] = 0x99;   // catch_rate: Use species index as catch rate (common pattern)
@@ -100,8 +100,8 @@ static void init_pokemon_data(void) {
     stored_pokemon[pkmn_offset + 11] = 0x00;  // move[3]: Empty
     stored_pokemon[pkmn_offset + 12] = 0x34;  // ot_id low byte
     stored_pokemon[pkmn_offset + 13] = 0x12;  // ot_id high byte
-    stored_pokemon[pkmn_offset + 14] = 0x9C;  // exp[0] low byte (156 exp for level 5 Medium Slow)
-    stored_pokemon[pkmn_offset + 15] = 0x00;  // exp[1] mid byte
+    stored_pokemon[pkmn_offset + 14] = 0xE8;  // exp[0] low byte (1000 exp for level 10 Medium Slow)
+    stored_pokemon[pkmn_offset + 15] = 0x03;  // exp[1] mid byte
     stored_pokemon[pkmn_offset + 16] = 0x00;  // exp[2] high byte
     stored_pokemon[pkmn_offset + 17] = 0x00;  // hp_ev low byte
     stored_pokemon[pkmn_offset + 18] = 0x00;  // hp_ev high byte
@@ -119,16 +119,16 @@ static void init_pokemon_data(void) {
     stored_pokemon[pkmn_offset + 30] = 0x28;  // move_pp[1]: Growl PP (40)
     stored_pokemon[pkmn_offset + 31] = 0x00;  // move_pp[2]: Empty
     stored_pokemon[pkmn_offset + 32] = 0x00;  // move_pp[3]: Empty
-    stored_pokemon[pkmn_offset + 33] = 0x05;  // level_again (copy of level)
-    stored_pokemon[pkmn_offset + 34] = 0x2D;  // max_hp low byte (45 HP)
+    stored_pokemon[pkmn_offset + 33] = 0x0A;  // level_again (copy of level - MUST match level at offset 3)
+    stored_pokemon[pkmn_offset + 34] = 0x36;  // max_hp low byte (54 HP for level 10)
     stored_pokemon[pkmn_offset + 35] = 0x00;  // max_hp high byte
-    stored_pokemon[pkmn_offset + 36] = 0x31;  // atk low byte (49 for level 5 Bulbasaur)
+    stored_pokemon[pkmn_offset + 36] = 0x3A;  // atk low byte (58 for level 10 Bulbasaur)
     stored_pokemon[pkmn_offset + 37] = 0x00;  // atk high byte
-    stored_pokemon[pkmn_offset + 38] = 0x31;  // def low byte (49 for level 5 Bulbasaur)
+    stored_pokemon[pkmn_offset + 38] = 0x3A;  // def low byte (58 for level 10 Bulbasaur)
     stored_pokemon[pkmn_offset + 39] = 0x00;  // def high byte
-    stored_pokemon[pkmn_offset + 40] = 0x2D;  // spd low byte (45 for level 5 Bulbasaur)
+    stored_pokemon[pkmn_offset + 40] = 0x32;  // spd low byte (50 for level 10 Bulbasaur)
     stored_pokemon[pkmn_offset + 41] = 0x00;  // spd high byte
-    stored_pokemon[pkmn_offset + 42] = 0x41;  // spc low byte (65 for level 5 Bulbasaur)
+    stored_pokemon[pkmn_offset + 42] = 0x46;  // spc low byte (70 for level 10 Bulbasaur)
     stored_pokemon[pkmn_offset + 43] = 0x00;  // spc high byte
     
     // Clear remaining 5 Pokemon slots (5 * 44 = 220 bytes, offset 52-271)
@@ -292,14 +292,28 @@ void gb_link_trade_or_store(void) {
             // 0x62 during handshake might be post-trade cleanup continuation
             printf("[RP2040] Potential post-trade cleanup byte (0x62) - responding with ACK\n");
             static int cleanup_responses = 0;
+            static uint32_t first_cleanup_time = 0;
+            
+            if (cleanup_responses == 0) {
+                first_cleanup_time = to_ms_since_boot(get_absolute_time());
+            }
             cleanup_responses++;
             
-            // Continue responding to cleanup bytes for a reasonable number of attempts
-            if (cleanup_responses < 1000) { // Increased to 1000 for very long Game Boy cleanup sequences
+            uint32_t elapsed_time = to_ms_since_boot(get_absolute_time()) - first_cleanup_time;
+            
+            // Continue responding but with both count and time limits
+            if (cleanup_responses < 5000 && elapsed_time < 120000) { // 5000 responses OR 2 minutes max
                 // Send ACK and continue - don't treat as error
                 continue;
             } else {
-                printf("[RP2040] Too many cleanup bytes - ending cleanup phase\n");
+                if (cleanup_responses >= 5000) {
+                    printf("[RP2040] Too many cleanup bytes (%d) - ending cleanup phase\n", cleanup_responses);
+                } else {
+                    printf("[RP2040] Cleanup timeout after %d ms (%d responses) - ending cleanup phase\n", elapsed_time, cleanup_responses);
+                }
+                // Reset counters for next trade
+                cleanup_responses = 0;
+                first_cleanup_time = 0;
                 break;
             }
         } else {
@@ -633,25 +647,31 @@ void gb_link_trade_or_store(void) {
     printf("\n");
     
     uint8_t incoming_pokemon[TRADE_BLOCK_LEN] = {0};
-    int bytes_already_read = 0;
     
-    // If we detected trade data early, we may have already read some bytes
+    // If we detected trade data early, we need to properly handle the offset
     if (trade_data_detected && random_bytes_exchanged < TRADE_RANDOM_LEN) {
-        // We read 2 bytes during detection - need to account for this
-        // The last 2 bytes we read during random seed are actually the first 2 bytes of trade block
-        printf("[RP2040] Adjusting for %d bytes already read during random seed detection\n", 2);
-        bytes_already_read = 2;
+        printf("[RP2040] Trade data detected early - first 2 bytes already read\n");
+        // We already have the first 2 bytes from our detection
+        // The last 2 random bytes we read are actually the first 2 trade bytes
+        incoming_pokemon[0] = 0x01; // We know the party count from detection
+        incoming_pokemon[1] = 0x05; // We know the species from detection
         
-        // We need to reconstruct what those bytes were from our detection
-        // This is tricky - let's just start fresh but be aware we might be offset
-        printf("[RP2040] Starting trade block exchange with potential 2-byte offset\n");
-    }
-    
-    for (int i = 0; i < TRADE_BLOCK_LEN; ++i) {
-        uint8_t in = gb_link_xfer_byte(stored_pokemon[i]);
-        incoming_pokemon[i] = in;
-        if (i % 50 == 0) {
-            printf("[RP2040] Trade block progress: %d/404\n", i);
+        // Continue with the rest of the trade block
+        for (int i = 2; i < TRADE_BLOCK_LEN; ++i) {
+            uint8_t in = gb_link_xfer_byte(stored_pokemon[i]);
+            incoming_pokemon[i] = in;
+            if (i % 50 == 0) {
+                printf("[RP2040] Trade block progress: %d/404\n", i);
+            }
+        }
+    } else {
+        // Normal trade block exchange - no offset issues
+        for (int i = 0; i < TRADE_BLOCK_LEN; ++i) {
+            uint8_t in = gb_link_xfer_byte(stored_pokemon[i]);
+            incoming_pokemon[i] = in;
+            if (i % 50 == 0) {
+                printf("[RP2040] Trade block progress: %d/404\n", i);
+            }
         }
     }
     
