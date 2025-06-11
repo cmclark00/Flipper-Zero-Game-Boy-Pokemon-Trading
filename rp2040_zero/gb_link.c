@@ -288,6 +288,20 @@ void gb_link_trade_or_store(void) {
         } else if (in == 0xFF) {
             printf("[RP2040] Communication error detected\n");
             break;
+        } else if (in == 0x62) {
+            // 0x62 during handshake might be post-trade cleanup continuation
+            printf("[RP2040] Potential post-trade cleanup byte (0x62) - responding with ACK\n");
+            static int cleanup_responses = 0;
+            cleanup_responses++;
+            
+            // Continue responding to cleanup bytes for a reasonable number of attempts
+            if (cleanup_responses < 1000) { // Increased to 1000 for very long Game Boy cleanup sequences
+                // Send ACK and continue - don't treat as error
+                continue;
+            } else {
+                printf("[RP2040] Too many cleanup bytes - ending cleanup phase\n");
+                break;
+            }
         } else {
             printf("[RP2040] Unexpected handshake byte: 0x%02X\n", in);
         }
@@ -422,9 +436,20 @@ void gb_link_trade_or_store(void) {
             printf("[RP2040] Blank negotiation, responding with 0xD0\n");
             response_byte = 0xD0;
         } else if (in == ITEM_1_SELECTED) { // 0xD4 - Trade Center selected!
-            printf("[RP2040] Trade Center confirmed! Responding with 0xD4\n");
-            response_byte = ITEM_1_SELECTED; // Echo Trade Center selection
-            trade_center_confirmed = true;
+            if (trade_center_confirmed) {
+                // If we've already confirmed once, try different responses to advance
+                if (negotiation_attempts > 10) {
+                    printf("[RP2040] Extended D4 sequence - trying 0x00 to advance\n");
+                    response_byte = 0x00;
+                } else {
+                    printf("[RP2040] Trade Center confirmed! Responding with 0xD4\n");
+                    response_byte = ITEM_1_SELECTED;
+                }
+            } else {
+                printf("[RP2040] Trade Center confirmed! Responding with 0xD4\n");
+                response_byte = ITEM_1_SELECTED; // Echo Trade Center selection
+                trade_center_confirmed = true;
+            }
         } else if (in == 0x60) {
             // Connection status bytes - very common after Trade Center selection
             printf("[RP2040] Connection status byte (0x60)\n");
@@ -825,9 +850,9 @@ void gb_link_trade_or_store(void) {
     printf("[RP2040] Entering post-trade cleanup phase...\n");
     
     int cleanup_attempts = 0;
-    const int max_cleanup_attempts = 200; // Allow up to 200 response cycles
+    const int max_cleanup_attempts = 500; // Allow up to 500 response cycles (for 36+ second animation)
     int consecutive_timeouts = 0;
-    const int max_consecutive_timeouts = 5; // Stop after 5 consecutive timeouts (allow more time)
+    const int max_consecutive_timeouts = 50; // Stop after 50 consecutive timeouts (allow 50+ seconds for full animation)
     bool communication_ended = false;
     
     while (cleanup_attempts < max_cleanup_attempts && !communication_ended) {
@@ -870,13 +895,11 @@ void gb_link_trade_or_store(void) {
             printf("[RP2040] Post-trade response %d: sent 0x62, received 0x%02X\n", cleanup_attempts, in);
         }
         
-        // Check for natural communication end signals
-        if (in == 0x00 || in == 0xFF) {
-            printf("[RP2040] Game Boy sent end signal (0x%02X) - cleanup complete\n", in);
-            // Send final acknowledgment
-            gb_link_xfer_byte(0x00);
-            communication_ended = true;
-            break;
+        // Log potential end signals but don't terminate - let timeout handle the end
+        if (in == 0x00) {
+            printf("[RP2040] Game Boy sent 0x00 (potential intermediate signal) - continuing cleanup\n");
+        } else if (in == 0xFF) {
+            printf("[RP2040] Game Boy sent 0xFF (potential error signal) - continuing cleanup\n");
         }
         
         cleanup_attempts++;
@@ -890,7 +913,7 @@ void gb_link_trade_or_store(void) {
     printf("[RP2040] Post-trade cleanup completed after %d responses\n", cleanup_attempts);
     
     // Final delay to ensure Game Boy has finished all processing
-    sleep_ms(1000);
+    sleep_ms(3000); // Longer delay to ensure Game Boy fully completes all sequences
     
     printf("[RP2040] Trade session fully completed - ready for new connections\n");
 } 
