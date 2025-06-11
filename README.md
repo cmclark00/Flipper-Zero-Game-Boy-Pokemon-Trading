@@ -506,3 +506,14 @@ The sprites for each Pokemon were hand-made for the monochrome screen of the Fli
 <br />
 From Talcahuano 🇨🇱 with ❤ 
 </p>
+
+## RP2040 Zero Port
+
+A new port for the Waveshare RP2040 Zero board is available in the `rp2040_zero/` directory. This version allows you to use the Game Boy Pokémon Trading/Storage application on the RP2040 Zero with the custom PCB described at [this repository](https://github.com/Raphael-Boichot/Collection-of-PCB-for-Game-Boy-Printer-Emulators#game-boy-printer-emulator-pcb-for-the-waveshare-rp2040-zero).
+
+**Features:**
+- Game Boy Link Cable communication via level shifter
+- Minimal UI (button and status LED)
+- SD card storage support
+
+See `rp2040_zero/README.md` for build and wiring instructions.

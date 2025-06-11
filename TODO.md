@@ -45,3 +45,4 @@
   - [ ] Implement some simple logic to be able to "battle" the Flipper?  
   - [ ] There was a suggestion to be able to trade in a Pokemon to harvest OT name and ID on the flipper and set it to that.  
   - [ ] Ability to save Pokemon to SD card. Either created on, or traded to, the Flipper app.  
+  - [x] Port to Waveshare RP2040 Zero (Game Boy link, button/LED UI, SD card storage) (in progress)  

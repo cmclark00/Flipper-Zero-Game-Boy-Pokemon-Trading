@@ -39,3 +39,4 @@ The Game Boy itself uses a shift register to clock data in and out.
 - Game Boy Advance (GBA)
 - Game Boy Advance SP (GBA SP)
 - Analogue Pocket
+- RP2040 Zero port available in `rp2040_zero/` for use with the custom PCB (see README.md for details)
