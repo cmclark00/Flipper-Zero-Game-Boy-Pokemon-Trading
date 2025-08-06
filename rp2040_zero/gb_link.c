@@ -1,939 +1,1102 @@
+#include "gb_link.h"
+#include "storage.h"
+#include "pico/stdlib.h"
+#include "hardware/gpio.h"
+#include "hardware/timer.h"
+#include "hardware/irq.h"
 #include <stdio.h>
 #include <string.h>
-#include "gb_link.h"
-#include "pico/stdlib.h"
-#include "pico/time.h"
 
-// Pin definitions for RP2040 Zero
-#define GB_SO_PIN 0 // Serial Out (from GB) -> GP0
-#define GB_SI_PIN 3 // Serial In (to GB)    -> GP3
-#define GB_SC_PIN 2 // Serial Clock         -> GP2
-// SD not used
+// Trade protocol states
+typedef enum {
+    TRADE_RESET,
+    TRADE_INIT,
+    TRADE_RANDOM,
+    TRADE_DATA,
+    TRADE_PATCH_HEADER,
+    TRADE_PATCH_DATA,
+    TRADE_SELECT,
+    TRADE_PENDING,
+    TRADE_CONFIRMATION,
+    TRADE_DONE,
+    TRADE_CANCEL
+} trade_centre_state_t;
 
-// Protocol constants (Gen I)
-#define PKMN_MASTER 0x01
-#define PKMN_SLAVE  0x02
-#define PKMN_BLANK  0x00
-#define PKMN_CONNECTED 0x60
-#define PKMN_TRADE_ACCEPT 0x62
-#define PKMN_TRADE_REJECT 0x61
-#define PKMN_TABLE_LEAVE 0x6f
-#define PKMN_SEL_NUM_MASK 0x60
-#define PKMN_SEL_NUM_ONE 0x60
-#define ITEM_1_SELECTED 0xD4
-#define SERIAL_PREAMBLE_BYTE 0xFD
-#define SERIAL_NO_DATA_BYTE 0xFE
+// Render states for UI feedback
+typedef enum {
+    GAMEBOY_CONN_FALSE,
+    GAMEBOY_CONN_TRUE,
+    GAMEBOY_READY,
+    GAMEBOY_WAITING,
+    GAMEBOY_TRADE_PENDING,
+    GAMEBOY_TRADING,
+    GAMEBOY_TRADE_CANCEL,
+    GAMEBOY_COLOSSEUM
+} render_gameboy_state_t;
+
+static gb_trade_state_t current_state = TRADE_STATE_NOT_CONNECTED;
+static trade_centre_state_t trade_centre_state = TRADE_RESET;
+static render_gameboy_state_t gameboy_status = GAMEBOY_CONN_FALSE;
+
+static uint8_t shift_register = 0;
+static uint8_t bit_count = 0;
+static uint8_t last_received = 0;
+static bool transfer_complete = false;
+
+// Party management buffer
+static uint8_t party_buffer[PARTY_DATA_SIZE];
+
+// Party management functions
+bool create_party_from_pokemon(const uint8_t* pokemon_data, uint8_t* party_buffer) {
+    if (pokemon_data == NULL || party_buffer == NULL) {
+        printf("ERROR: NULL pointers in create_party_from_pokemon\n");
+        return false;
+    }
+    
+    // Clear the party buffer
+    memset(party_buffer, 0, PARTY_DATA_SIZE);
+    
+    // Set party count to 1 (we have one Pokemon)
+    party_buffer[0] = 1;
+    
+    // Set species list - first entry is our Pokemon's species, rest are 0xFF
+    party_buffer[1] = pokemon_data[0]; // Species ID from Pokemon data
+    for (int i = 2; i < 7; i++) {
+        party_buffer[i] = 0xFF; // Terminator/empty slots
+    }
+    
+    // Convert 415-byte individual Pokemon data to 44-byte party format
+    // Mapping based on Generation I Pokemon data structure:
+    uint8_t* party_pokemon = &party_buffer[8]; // Start of first Pokemon slot (after count + species list)
+    
+    // Copy essential Pokemon data (44 bytes total)
+    party_pokemon[0] = pokemon_data[0];   // Species
+    party_pokemon[1] = pokemon_data[1];   // Current HP high byte
+    party_pokemon[2] = pokemon_data[1];   // Current HP low byte (duplicate for simplicity)
+    party_pokemon[3] = pokemon_data[2];   // Level
+    party_pokemon[4] = pokemon_data[3];   // Status condition
+    party_pokemon[5] = pokemon_data[4];   // Type 1
+    party_pokemon[6] = pokemon_data[5];   // Type 2
+    party_pokemon[7] = pokemon_data[6];   // Catch rate/hold item
+    
+    // Moves (4 bytes)
+    party_pokemon[8] = pokemon_data[8];   // Move 1
+    party_pokemon[9] = pokemon_data[9];   // Move 2
+    party_pokemon[10] = pokemon_data[10]; // Move 3
+    party_pokemon[11] = pokemon_data[11]; // Move 4
+    
+    // OT ID (2 bytes)
+    party_pokemon[12] = pokemon_data[12]; // OT ID high
+    party_pokemon[13] = pokemon_data[13]; // OT ID low
+    
+    // Experience (3 bytes)
+    party_pokemon[14] = pokemon_data[14]; // Experience high
+    party_pokemon[15] = pokemon_data[15]; // Experience mid
+    party_pokemon[16] = pokemon_data[16]; // Experience low
+    
+    // HP EV (2 bytes)
+    party_pokemon[17] = pokemon_data[17];
+    party_pokemon[18] = pokemon_data[18];
+    
+    // Attack EV (2 bytes)
+    party_pokemon[19] = pokemon_data[19];
+    party_pokemon[20] = pokemon_data[20];
+    
+    // Defense EV (2 bytes)
+    party_pokemon[21] = pokemon_data[21];
+    party_pokemon[22] = pokemon_data[22];
+    
+    // Speed EV (2 bytes)
+    party_pokemon[23] = pokemon_data[23];
+    party_pokemon[24] = pokemon_data[24];
+    
+    // Special EV (2 bytes)
+    party_pokemon[25] = pokemon_data[25];
+    party_pokemon[26] = pokemon_data[26];
+    
+    // IV data (2 bytes)
+    party_pokemon[27] = pokemon_data[27]; // Attack/Defense IV
+    party_pokemon[28] = pokemon_data[28]; // Speed/Special IV
+    
+    // Move PP (4 bytes)
+    party_pokemon[29] = pokemon_data[29]; // Move 1 PP
+    party_pokemon[30] = pokemon_data[30]; // Move 2 PP
+    party_pokemon[31] = pokemon_data[31]; // Move 3 PP
+    party_pokemon[32] = pokemon_data[32]; // Move 4 PP
+    
+    // Level (1 byte)
+    party_pokemon[33] = pokemon_data[33];
+    
+    // Current stats (10 bytes) - use values from original Pokemon data
+    party_pokemon[34] = pokemon_data[52]; // Max HP low
+    party_pokemon[35] = pokemon_data[51]; // Max HP high
+    party_pokemon[36] = pokemon_data[54]; // Attack low
+    party_pokemon[37] = pokemon_data[53]; // Attack high
+    party_pokemon[38] = pokemon_data[56]; // Defense low
+    party_pokemon[39] = pokemon_data[55]; // Defense high
+    party_pokemon[40] = pokemon_data[58]; // Speed low
+    party_pokemon[41] = pokemon_data[57]; // Speed high
+    party_pokemon[42] = pokemon_data[60]; // Special low
+    party_pokemon[43] = pokemon_data[59]; // Special high
+    
+    // Copy OT names (11 bytes * 6 Pokemon = 66 bytes starting at offset 8 + 6*44 = 272)
+    uint8_t* ot_names = &party_buffer[272];
+    memcpy(ot_names, &pokemon_data[63], 11); // Copy first OT name
+    
+    // Copy nicknames (11 bytes * 6 Pokemon = 66 bytes starting at offset 272 + 66 = 338)
+    uint8_t* nicknames = &party_buffer[338];
+    memcpy(nicknames, &pokemon_data[52], 11); // Copy first nickname
+    
+    printf("Created party data: count=%d, species=0x%02X\n", party_buffer[0], party_buffer[1]);
+    return true;
+}
+
+bool extract_pokemon_from_party(const uint8_t* party_data, uint8_t slot, uint8_t* pokemon_buffer) {
+    if (party_data == NULL || pokemon_buffer == NULL) {
+        printf("ERROR: NULL pointers in extract_pokemon_from_party\n");
+        return false;
+    }
+    
+    if (slot >= 6 || slot >= party_data[0]) {
+        printf("ERROR: Invalid slot %d (party has %d Pokemon)\n", slot, party_data[0]);
+        return false;
+    }
+    
+    // Clear the Pokemon buffer first
+    memset(pokemon_buffer, 0, POKEMON_DATA_SIZE);
+    
+    // Extract Pokemon data from the party structure
+    const uint8_t* party_pokemon = &party_data[8 + (slot * 44)]; // Each Pokemon is 44 bytes
+    
+    // Convert 44-byte party format back to 415-byte individual format
+    // This is a simplified conversion - copy the essential data
+    pokemon_buffer[0] = party_pokemon[0];   // Species
+    pokemon_buffer[1] = party_pokemon[1];   // HP
+    pokemon_buffer[2] = party_pokemon[3];   // Level
+    pokemon_buffer[3] = party_pokemon[4];   // Status
+    pokemon_buffer[4] = party_pokemon[5];   // Type 1
+    pokemon_buffer[5] = party_pokemon[6];   // Type 2
+    pokemon_buffer[6] = party_pokemon[7];   // Catch rate
+    
+    // Copy moves
+    memcpy(&pokemon_buffer[8], &party_pokemon[8], 4);
+    
+    // Copy OT ID, Experience, EVs, IVs, Move PP
+    memcpy(&pokemon_buffer[12], &party_pokemon[12], 21);
+    
+    // Copy level again
+    pokemon_buffer[33] = party_pokemon[33];
+    
+    // Copy stats (convert back to little-endian format)
+    pokemon_buffer[51] = party_pokemon[35]; // Max HP high
+    pokemon_buffer[52] = party_pokemon[34]; // Max HP low
+    pokemon_buffer[53] = party_pokemon[37]; // Attack high
+    pokemon_buffer[54] = party_pokemon[36]; // Attack low
+    pokemon_buffer[55] = party_pokemon[39]; // Defense high
+    pokemon_buffer[56] = party_pokemon[38]; // Defense low
+    pokemon_buffer[57] = party_pokemon[41]; // Speed high
+    pokemon_buffer[58] = party_pokemon[40]; // Speed low
+    pokemon_buffer[59] = party_pokemon[43]; // Special high
+    pokemon_buffer[60] = party_pokemon[42]; // Special low
+    
+    // Copy OT name and nickname from their respective sections
+    const uint8_t* ot_names = &party_data[272];
+    const uint8_t* nicknames = &party_data[338];
+    
+    memcpy(&pokemon_buffer[63], &ot_names[slot * 11], 11);
+    memcpy(&pokemon_buffer[52], &nicknames[slot * 11], 11);
+    
+    printf("Extracted Pokemon from party slot %d: species=0x%02X, level=%d\n", 
+           slot, pokemon_buffer[0], pokemon_buffer[2]);
+    return true;
+}
+
+void debug_party_data(const uint8_t* party_data, const char* title) {
+    printf("\n=== %s ===\n", title);
+    if (party_data == NULL) {
+        printf("Party data is NULL\n");
+        return;
+    }
+    
+    printf("Party count: %d\n", party_data[0]);
+    printf("Species list: ");
+    for (int i = 1; i < 7; i++) {
+        if (party_data[i] == 0xFF) {
+            printf("FF ");
+        } else {
+            printf("%02X ", party_data[i]);
+        }
+    }
+    printf("\n");
+    
+    // Show first Pokemon data if present
+    if (party_data[0] > 0) {
+        const uint8_t* first_pokemon = &party_data[8];
+        printf("First Pokemon: species=0x%02X, level=%d, HP=%d/%d\n", 
+               first_pokemon[0], first_pokemon[3], 
+               first_pokemon[1], (first_pokemon[35] << 8) | first_pokemon[34]);
+    }
+    
+    printf("Party data size: %d bytes\n", PARTY_DATA_SIZE);
+    printf("==========================\n\n");
+}
+
+// Additional protocol constants not in header
+#define PKMN_CONNECTED_II       0x61
+#define ITEM_1_SELECTED         0xD4  // TRADE_CENTRE
+#define ITEM_2_SELECTED         0xD5  // COLOSSEUM  
+#define ITEM_3_SELECTED         0xD6  // BREAK_LINK
+
+#define SERIAL_PREAMBLE_BYTE    0xFD
+#define SERIAL_NO_DATA_BYTE     0xFE
+#define SERIAL_RNS_LENGTH       10
+#define SERIAL_TRADE_PREAMBLE_LENGTH 9
 #define SERIAL_PATCH_LIST_PART_TERMINATOR 0xFF
 
-// Trade block sizes
-#define TRADE_PREAMBLE_LEN 10
-#define TRADE_RANDOM_LEN 10
-#define TRADE_BLOCK_LEN 415  // Original Gen 1 trade block: 11+1+7+264+66+66+3 = 415 bytes
-#define TRADE_END_LEN 3
-#define TRADE_END_BYTES {0xDF, 0xFE, 0x15}
-#define TRADE_POST_PREAMBLE_LEN 3
-#define PATCH_LIST_HEADER_LEN 6
-#define PATCH_LIST_BLANK_LEN 7
-#define PATCH_LIST_DATA_LEN 189
+#define PKMN_TRADE_ACCEPT_GEN_I 0x62
+#define PKMN_TRADE_REJECT_GEN_I 0x61
+#define PKMN_TABLE_LEAVE_GEN_I  0x6f
+#define PKMN_SEL_NUM_MASK_GEN_I 0x60
+#define PKMN_SEL_NUM_ONE_GEN_I  0x60
 
-// State machine for trade protocol
-typedef enum {
-    LINK_STATE_CONN_FALSE,
-    LINK_STATE_CONN_TRUE,
-    LINK_STATE_READY,
-    LINK_STATE_TRADE_PREAMBLE,
-    LINK_STATE_TRADE_RANDOM,
-    LINK_STATE_TRADE_BLOCK,
-    LINK_STATE_TRADE_END,
-    LINK_STATE_PATCH_HEADER,
-    LINK_STATE_PATCH_BLANK,
-    LINK_STATE_PATCH_DATA,
-    LINK_STATE_DONE
-} link_state_t;
+// Timing constants (in microseconds)
+#define BIT_TIMEOUT_US      1000
+#define BYTE_TIMEOUT_US     10000
+#define CONNECTION_TIMEOUT_US 5000000  // 5 seconds
 
-static link_state_t link_state = LINK_STATE_CONN_FALSE;
+static uint64_t last_bit_time = 0;
+static uint64_t last_byte_time = 0;
 
-// Valid Pokémon data - Level 5 Pikachu with proper Gen 1 structure
-static uint8_t stored_pokemon[TRADE_BLOCK_LEN];
+// Trade data exchange - now handles party data (404 bytes) instead of individual Pokemon (415 bytes)
+static uint8_t received_pokemon_data[PARTY_DATA_SIZE];
+static size_t trade_data_counter = 0;
+static bool patch_pt_2 = false;
+static uint8_t in_pkmn_idx = 0;
 
-// Initialize with proper Gen 1 Pokémon party structure  
-static void init_pokemon_data(void) {
-    // Clear entire array first
-    for (int i = 0; i < TRADE_BLOCK_LEN; i++) {
-        stored_pokemon[i] = 0x00;
-    }
-    
-    // === CORRECT POKEMON PARTY STRUCTURE (404 bytes total) ===
-    // According to Generation I Pokemon data structure research:
-    // 1. Party Count: 1 byte (offset 0)
-    // 2. Species List: 7 bytes (offset 1-7, terminated with 0xFF, padded with 0x00)
-    // 3. Pokemon Data: 6 × 44 bytes (offset 8-271)
-    // 4. OT Names: 6 × 11 bytes (offset 272-337)
-    // 5. Nicknames: 6 × 11 bytes (offset 338-403)
-    // Total: 1 + 7 + 264 + 66 + 66 = 404 bytes
-    
-    // === PARTY COUNT (1 byte, offset 0) ===
-    stored_pokemon[0] = 0x01; // 1 Pokemon in party
-    
-    // === SPECIES LIST (7 bytes, offset 1-7) ===
-    stored_pokemon[1] = 0x99; // Bulbasaur internal index (verified correct)
-    stored_pokemon[2] = 0xFF; // List terminator (CRITICAL! Must come immediately after last Pokemon)
-    for (int i = 3; i < 8; i++) {
-        stored_pokemon[i] = 0x00; // Remaining slots padded with 0x00
-    }
-    
-    // === POKEMON DATA (44 bytes starting at offset 8) ===
-    // First Pokemon (Bulbasaur) - 44 bytes starting at offset 8
-    int pkmn_offset = 8;
-    
-    stored_pokemon[pkmn_offset + 0] = 0x99;   // species: Bulbasaur internal index (correct)
-    stored_pokemon[pkmn_offset + 1] = 0x36;   // current hp low byte (54 HP - MUST BE > 0 and match max HP)
-    stored_pokemon[pkmn_offset + 2] = 0x00;   // current hp high byte
-    stored_pokemon[pkmn_offset + 3] = 0x0A;   // level: 10 (higher level to ensure validity)
-    stored_pokemon[pkmn_offset + 4] = 0x00;   // status_condition (0x00 = healthy, NOT fainted)
-    stored_pokemon[pkmn_offset + 5] = 0x16;   // type[0]: Grass (0x16 - verified correct)
-    stored_pokemon[pkmn_offset + 6] = 0x03;   // type[1]: Poison (0x03 - verified correct)  
-    stored_pokemon[pkmn_offset + 7] = 0x99;   // catch_rate: Use species index as catch rate (common pattern)
-    stored_pokemon[pkmn_offset + 8] = 0x21;   // move[0]: Tackle (0x21 - verified Gen 1 index)
-    stored_pokemon[pkmn_offset + 9] = 0x2D;   // move[1]: Growl (0x2D - verified Gen 1 index)  
-    stored_pokemon[pkmn_offset + 10] = 0x00;  // move[2]: Empty
-    stored_pokemon[pkmn_offset + 11] = 0x00;  // move[3]: Empty
-    stored_pokemon[pkmn_offset + 12] = 0x34;  // ot_id low byte
-    stored_pokemon[pkmn_offset + 13] = 0x12;  // ot_id high byte
-    stored_pokemon[pkmn_offset + 14] = 0xE8;  // exp[0] low byte (1000 exp for level 10 Medium Slow)
-    stored_pokemon[pkmn_offset + 15] = 0x03;  // exp[1] mid byte
-    stored_pokemon[pkmn_offset + 16] = 0x00;  // exp[2] high byte
-    stored_pokemon[pkmn_offset + 17] = 0x00;  // hp_ev low byte
-    stored_pokemon[pkmn_offset + 18] = 0x00;  // hp_ev high byte
-    stored_pokemon[pkmn_offset + 19] = 0x00;  // atk_ev low byte
-    stored_pokemon[pkmn_offset + 20] = 0x00;  // atk_ev high byte
-    stored_pokemon[pkmn_offset + 21] = 0x00;  // def_ev low byte
-    stored_pokemon[pkmn_offset + 22] = 0x00;  // def_ev high byte
-    stored_pokemon[pkmn_offset + 23] = 0x00;  // spd_ev low byte
-    stored_pokemon[pkmn_offset + 24] = 0x00;  // spd_ev high byte
-    stored_pokemon[pkmn_offset + 25] = 0x00;  // spc_ev low byte
-    stored_pokemon[pkmn_offset + 26] = 0x00;  // spc_ev high byte
-    stored_pokemon[pkmn_offset + 27] = 0xAA;  // iv low byte (Attack=10, Defense=10) 
-    stored_pokemon[pkmn_offset + 28] = 0xAA;  // iv high byte (Speed=10, Special=10)
-    stored_pokemon[pkmn_offset + 29] = 0x23;  // move_pp[0]: Tackle PP (35)
-    stored_pokemon[pkmn_offset + 30] = 0x28;  // move_pp[1]: Growl PP (40)
-    stored_pokemon[pkmn_offset + 31] = 0x00;  // move_pp[2]: Empty
-    stored_pokemon[pkmn_offset + 32] = 0x00;  // move_pp[3]: Empty
-    stored_pokemon[pkmn_offset + 33] = 0x0A;  // level_again (copy of level - MUST match level at offset 3)
-    stored_pokemon[pkmn_offset + 34] = 0x36;  // max_hp low byte (54 HP for level 10)
-    stored_pokemon[pkmn_offset + 35] = 0x00;  // max_hp high byte
-    stored_pokemon[pkmn_offset + 36] = 0x3A;  // atk low byte (58 for level 10 Bulbasaur)
-    stored_pokemon[pkmn_offset + 37] = 0x00;  // atk high byte
-    stored_pokemon[pkmn_offset + 38] = 0x3A;  // def low byte (58 for level 10 Bulbasaur)
-    stored_pokemon[pkmn_offset + 39] = 0x00;  // def high byte
-    stored_pokemon[pkmn_offset + 40] = 0x32;  // spd low byte (50 for level 10 Bulbasaur)
-    stored_pokemon[pkmn_offset + 41] = 0x00;  // spd high byte
-    stored_pokemon[pkmn_offset + 42] = 0x46;  // spc low byte (70 for level 10 Bulbasaur)
-    stored_pokemon[pkmn_offset + 43] = 0x00;  // spc high byte
-    
-    // Clear remaining 5 Pokemon slots (5 * 44 = 220 bytes, offset 52-271)
-    for (int i = pkmn_offset + 44; i < 272; i++) {
-        stored_pokemon[i] = 0x00;
-    }
-    
-    // === OT NAMES (6 * 11 bytes, offset 272-337) ===
-    // First Pokemon OT name "ABCDE" with correct Gen 1 encoding
-    int ot_offset = 272;
-    stored_pokemon[ot_offset + 0] = 0x80;  // A (0x80)
-    stored_pokemon[ot_offset + 1] = 0x81;  // B (0x81) 
-    stored_pokemon[ot_offset + 2] = 0x82;  // C (0x82)
-    stored_pokemon[ot_offset + 3] = 0x83;  // D (0x83)
-    stored_pokemon[ot_offset + 4] = 0x84;  // E (0x84)
-    stored_pokemon[ot_offset + 5] = 0x50;  // String terminator
-    for (int i = ot_offset + 6; i < ot_offset + 11; i++) {
-        stored_pokemon[i] = 0x50; // Fill with terminators
-    }
-    
-    // Clear remaining 5 OT name slots (5 * 11 = 55 bytes)
-    for (int i = ot_offset + 11; i < 338; i++) {
-        stored_pokemon[i] = 0x50;
-    }
-    
-    // === NICKNAMES (6 * 11 bytes, offset 338-403) ===
-    // First Pokemon nickname "BULBASAUR" with correct Gen 1 encoding
-    int nick_offset = 338;
-    stored_pokemon[nick_offset + 0] = 0x81;  // B
-    stored_pokemon[nick_offset + 1] = 0x94;  // U
-    stored_pokemon[nick_offset + 2] = 0x8B;  // L
-    stored_pokemon[nick_offset + 3] = 0x81;  // B
-    stored_pokemon[nick_offset + 4] = 0x80;  // A
-    stored_pokemon[nick_offset + 5] = 0x92;  // S
-    stored_pokemon[nick_offset + 6] = 0x80;  // A
-    stored_pokemon[nick_offset + 7] = 0x94;  // U
-    stored_pokemon[nick_offset + 8] = 0x91;  // R
-    stored_pokemon[nick_offset + 9] = 0x50;  // Terminator
-    stored_pokemon[nick_offset + 10] = 0x50; // Fill with terminator
-    
-    // Clear remaining 5 nickname slots (5 * 11 = 55 bytes)  
-    for (int i = nick_offset + 11; i < 404; i++) {
-        stored_pokemon[i] = 0x50;
-    }
-}
+// Bidirectional trading support
+static uint8_t selected_pokemon_slot = 0;
+static uint8_t receive_pokemon_slot = 0;
+static bool bidirectional_mode = false;
 
-// Helper: Set up GPIOs for link cable
-void gb_link_init(void) {
-    printf("[RP2040] Initializing Game Boy Link Cable Interface...\n");
-    
-    // Initialize Pokémon data
-    init_pokemon_data();
-    printf("[RP2040] Initialized Pokémon data - Party Count: 0x%02X, Species: 0x%02X, Level: %d\n", 
-           stored_pokemon[0], stored_pokemon[8], stored_pokemon[11]);
-    
-    // Debug: Print party structure bytes
-    printf("[RP2040] Party structure: Count=0x%02X, Species=0x%02X, Terminator=0x%02X\n",
-           stored_pokemon[0], stored_pokemon[1], stored_pokemon[2]);
-    
-    // Debug: Print trainer name bytes (first OT name at offset 272-282)
-    printf("[RP2040] Trainer name bytes: ");
-    for (int i = 272; i < 283; i++) {
-        printf("0x%02X ", stored_pokemon[i]);
-    }
-    printf("\n");
-    
-    gpio_init(GB_SO_PIN); gpio_set_dir(GB_SO_PIN, GPIO_IN); gpio_pull_up(GB_SO_PIN);
-    gpio_init(GB_SI_PIN); gpio_set_dir(GB_SI_PIN, GPIO_OUT); gpio_put(GB_SI_PIN, 1);
-    gpio_init(GB_SC_PIN); gpio_set_dir(GB_SC_PIN, GPIO_IN); gpio_pull_up(GB_SC_PIN);
-    
-    printf("[RP2040] GPIO initialized - SO:%d SI:%d SC:%d\n", 
-           gpio_get(GB_SO_PIN), gpio_get(GB_SI_PIN), gpio_get(GB_SC_PIN));
-}
+// Trade center negotiation tracking
+static bool trade_center_confirmed = false;
+static int negotiation_attempts = 0;
+static int consecutive_ff_count = 0;
+static int trade_init_attempts = 0;
+static uint64_t negotiation_start_time = 0;
 
-// Helper: Wait for clock edge with timeout
-static bool wait_for_clock_rising_timeout(uint32_t timeout_ms) {
-    uint32_t start = to_ms_since_boot(get_absolute_time());
-    while (!gpio_get(GB_SC_PIN)) {
-        if (to_ms_since_boot(get_absolute_time()) - start > timeout_ms) {
-            return false;
-        }
-        tight_loop_contents();
-    }
-    return true;
-}
+// Output data for sending to Game Boy
+static uint8_t output_byte = 0x00;
+static int output_bit_pos = 7;
 
-static bool wait_for_clock_falling_timeout(uint32_t timeout_ms) {
-    uint32_t start = to_ms_since_boot(get_absolute_time());
-    while (gpio_get(GB_SC_PIN)) {
-        if (to_ms_since_boot(get_absolute_time()) - start > timeout_ms) {
-            return false;
-        }
-        tight_loop_contents();
-    }
-    return true;
-}
+// Simplified interrupt handler - minimal processing to avoid crashes
+static volatile bool isr_error = false;
+static volatile uint32_t isr_call_count = 0;
 
-// Bit-bang a single byte (slave mode: respond to GB clock)
-static uint8_t gb_link_xfer_byte(uint8_t out_byte) {
-    uint8_t in_byte = 0;
+void gb_clock_isr() {
+    isr_call_count++;
     
-    for (int i = 0; i < 8; ++i) {
-        // Wait for clock falling edge with timeout
-        if (!wait_for_clock_falling_timeout(1000)) {
-            printf("[RP2040] Clock timeout on falling edge, bit %d\n", i);
-            return 0xFF; // Return error value
-        }
-        
-        // Set output bit
-        gpio_put(GB_SI_PIN, (out_byte & 0x80) ? 1 : 0);
-        out_byte <<= 1;
-        
-        // Wait for clock rising edge with timeout
-        if (!wait_for_clock_rising_timeout(1000)) {
-            printf("[RP2040] Clock timeout on rising edge, bit %d\n", i);
-            return 0xFF; // Return error value
-        }
-        
-        // Read input bit
-        in_byte <<= 1;
-        if (gpio_get(GB_SO_PIN)) in_byte |= 1;
-    }
-    
-    // Keep SI line high when idle
-    gpio_put(GB_SI_PIN, 1);
-    return in_byte;
-}
-
-// Main trade protocol loop (called when button pressed)
-void gb_link_trade_or_store(void) {
-    link_state = LINK_STATE_CONN_FALSE;
-    printf("[RP2040] Starting Game Boy communication...\n");
-    printf("[RP2040] Waiting for Game Boy to initiate connection...\n");
-    
-    // Step 1: Initial connection handshake
-    // The Game Boy sends various bytes during initialization
-    // We need to respond appropriately to establish the connection
-    uint32_t handshake_timeout = 10000; // 10 second timeout
-    uint32_t start_time = to_ms_since_boot(get_absolute_time());
-    bool connected = false;
-    
-    while (!connected && (to_ms_since_boot(get_absolute_time()) - start_time < handshake_timeout)) {
-        uint8_t in = gb_link_xfer_byte(PKMN_SLAVE);
-        printf("[RP2040] Handshake - Received: 0x%02X, Sent: 0x%02X\n", in, PKMN_SLAVE);
-        
-        // Look for the master signal or connected signal
-        if (in == PKMN_MASTER) {
-            printf("[RP2040] Master signal detected!\n");
-            connected = true;
-            link_state = LINK_STATE_CONN_TRUE;
-        } else if (in == PKMN_CONNECTED) {
-            printf("[RP2040] Connection signal detected!\n");
-            // Continue - this often comes before MASTER
-        } else if (in == PKMN_BLANK) {
-            // Normal blank response during negotiation
-            printf("[RP2040] Blank byte during handshake\n");
-        } else if (in == 0xFF) {
-            printf("[RP2040] Communication error detected\n");
-            break;
-        } else if (in == 0x62) {
-            // 0x62 during handshake might be post-trade cleanup continuation
-            printf("[RP2040] Potential post-trade cleanup byte (0x62) - responding with ACK\n");
-            static int cleanup_responses = 0;
-            static uint32_t first_cleanup_time = 0;
-            
-            if (cleanup_responses == 0) {
-                first_cleanup_time = to_ms_since_boot(get_absolute_time());
-            }
-            cleanup_responses++;
-            
-            uint32_t elapsed_time = to_ms_since_boot(get_absolute_time()) - first_cleanup_time;
-            
-            // Continue responding but with both count and time limits
-            if (cleanup_responses < 5000 && elapsed_time < 120000) { // 5000 responses OR 2 minutes max
-                // Send ACK and continue - don't treat as error
-                continue;
-            } else {
-                if (cleanup_responses >= 5000) {
-                    printf("[RP2040] Too many cleanup bytes (%d) - ending cleanup phase\n", cleanup_responses);
-                } else {
-                    printf("[RP2040] Cleanup timeout after %d ms (%d responses) - ending cleanup phase\n", elapsed_time, cleanup_responses);
-                }
-                // Reset counters for next trade
-                cleanup_responses = 0;
-                first_cleanup_time = 0;
-                break;
-            }
-        } else {
-            printf("[RP2040] Unexpected handshake byte: 0x%02X\n", in);
-        }
-        
-        tight_loop_contents(); // No delay for faster handshake
-    }
-    
-    if (!connected) {
-        printf("[RP2040] Failed to establish connection with Game Boy\n");
+    // Safety check - prevent runaway interrupts
+    if (isr_call_count > 10000) {
+        isr_error = true;
         return;
     }
     
-    printf("[RP2040] Connected to Game Boy successfully!\n");
+    // Very simple interrupt handler - just track basic state
+    bool clock_high = gpio_get(GB_CLK_PIN);
+    last_bit_time = time_us_64();
     
-    // Step 2: Menu negotiation
-    printf("[RP2040] Waiting for menu selection...\n");
-    uint32_t menu_timeout = 30000; // 30 second timeout for user to select
-    start_time = to_ms_since_boot(get_absolute_time());
-    bool menu_selected = false;
-    int consecutive_blanks = 0;
-    int consecutive_connected = 0;
-    
-    static uint8_t last_response = PKMN_SLAVE;
-    
-    while (!menu_selected && (to_ms_since_boot(get_absolute_time()) - start_time < menu_timeout)) {
-        uint8_t response = last_response;  // Use previous response pattern
-        
-        // After many connection confirmations, start responding with CONNECTED
-        if (consecutive_connected > 10) {
-            response = PKMN_CONNECTED;
-        }
-        
-        uint8_t in = gb_link_xfer_byte(response);
-        printf("[RP2040] Menu phase - Received: 0x%02X\n", in);
-        
-        if (in == ITEM_1_SELECTED) {
-            printf("[RP2040] Trade menu selected by user!\n");
-            link_state = LINK_STATE_READY;
-            menu_selected = true;
-        } else if (in == PKMN_CONNECTED) {
-            // Game Boy is confirming connection
-            printf("[RP2040] Connection confirmed during menu\n");
-            consecutive_connected++;
-            consecutive_blanks = 0;
-        } else if (in == PKMN_BLANK) {
-            // Normal menu navigation
-            printf("[RP2040] Menu navigation in progress\n");
-            consecutive_blanks++;
-            consecutive_connected = 0;
+    if (clock_high) {
+        // Rising edge - read data from Game Boy
+        if (bit_count < 8) {
+            shift_register <<= 1;
+            if (gpio_get(GB_SO_PIN)) {
+                shift_register |= 1;
+            }
+            bit_count++;
             
-            // Don't assume trade initiation from blank bytes alone
-            // Wait for actual trade selection signal
-        } else if (in >= 0x60 && in <= 0x6F) {
-            // Menu selection values - respond appropriately
-            printf("[RP2040] Menu selection byte: 0x%02X\n", in);
-            consecutive_blanks = 0;
-            consecutive_connected = 0;
-        } else if (in == 0xD0 || in == 0xD4) {
-            // Trade-related bytes detected
-            printf("[RP2040] Trade-related byte detected: 0x%02X\n", in);
-            if (in == ITEM_1_SELECTED) {  // 0xD4
-                printf("[RP2040] Trade menu explicitly selected!\n");
-                link_state = LINK_STATE_READY;
-                menu_selected = true;
-            } else if (in == 0xD0) {
-                // Count consecutive 0xD0 bytes - this might indicate trade readiness
-                static int consecutive_d0 = 0;
-                consecutive_d0++;
-                if (consecutive_d0 >= 8) {  // After several 0xD0 bytes, assume trade is ready
-                    printf("[RP2040] Multiple 0xD0 bytes detected - assuming trade ready\n");
-                    link_state = LINK_STATE_READY;
-                    menu_selected = true;
-                }
-                last_response = 0xD0;  // Next response will be 0xD0
-            }
-            consecutive_blanks = 0;
-            consecutive_connected = 0;
-        } else if (in == SERIAL_PREAMBLE_BYTE) {  // 0xFD
-            // Preamble byte detected - trade is starting
-            printf("[RP2040] Preamble byte detected - trade starting!\n");
-            link_state = LINK_STATE_READY;
-            menu_selected = true;
-            consecutive_blanks = 0;
-            consecutive_connected = 0;
-        } else if (in == PKMN_MASTER) {
-            // Game Boy is still in master mode
-            printf("[RP2040] Master signal during menu\n");
-            consecutive_blanks = 0;
-            consecutive_connected = 0;
-        } else if (in == 0xFF) {
-            printf("[RP2040] Communication error in menu - attempting to continue\n");
-            consecutive_blanks = 0;
-            consecutive_connected = 0;
-        } else {
-            printf("[RP2040] Unknown menu byte: 0x%02X\n", in);
-            consecutive_blanks = 0;
-            consecutive_connected = 0;
-        }
-        
-        sleep_ms(1); // Reduced delay for more responsive menu
-    }
-    
-    if (!menu_selected) {
-        printf("[RP2040] Menu selection timeout\n");
-        return;
-    }
-    
-    // Step 3: Trade protocol
-    printf("[RP2040] Starting trade protocol...\n");
-    
-    // Handle initial trade negotiation phase
-    printf("[RP2040] Waiting for trade negotiation to complete...\n");
-    int negotiation_attempts = 0;
-    const int max_negotiation_attempts = 100; // Increased limit for negotiation phase
-    bool negotiation_complete = false;
-    bool trade_center_confirmed = false;
-    
-    // The 0x00/0xD0 exchanges are negotiation, not preamble
-    // We need to complete this phase before looking for actual preamble
-    while (negotiation_attempts < max_negotiation_attempts && !negotiation_complete) {
-        uint8_t response_byte = 0x00; // Start with safe default
-        
-        uint8_t in = gb_link_xfer_byte(response_byte);
-        printf("[RP2040] Negotiation byte: 0x%02X (attempt %d)\n", in, negotiation_attempts);
-        
-        if (in == 0xD0) {
-            // D0 negotiation - respond with 0x00 to progress
-            printf("[RP2040] D0 negotiation, responding with 0x00\n");
-            response_byte = 0x00;
-        } else if (in == 0x00) {
-            // Blank negotiation - respond with 0xD0 to progress
-            printf("[RP2040] Blank negotiation, responding with 0xD0\n");
-            response_byte = 0xD0;
-        } else if (in == ITEM_1_SELECTED) { // 0xD4 - Trade Center selected!
-            if (trade_center_confirmed) {
-                // If we've already confirmed once, try different responses to advance
-                if (negotiation_attempts > 10) {
-                    printf("[RP2040] Extended D4 sequence - trying 0x00 to advance\n");
-                    response_byte = 0x00;
-                } else {
-                    printf("[RP2040] Trade Center confirmed! Responding with 0xD4\n");
-                    response_byte = ITEM_1_SELECTED;
-                }
-            } else {
-                printf("[RP2040] Trade Center confirmed! Responding with 0xD4\n");
-                response_byte = ITEM_1_SELECTED; // Echo Trade Center selection
-                trade_center_confirmed = true;
-            }
-        } else if (in == 0x60) {
-            // Connection status bytes - very common after Trade Center selection
-            printf("[RP2040] Connection status byte (0x60)\n");
-            
-            // If we've confirmed Trade Center and seen many 0x60 bytes, we're likely ready
-            if (trade_center_confirmed && negotiation_attempts > 20) {
-                printf("[RP2040] Trade Center confirmed + extended 0x60 sequence = ready for preamble!\n");
-                negotiation_complete = true;
-                break;
-            } else {
-                // Continue with connection confirmation
-                response_byte = 0x60;
-            }
-        } else if (in == 0xFE) {
-            // Potential preamble or disconnection indicator
-            printf("[RP2040] FE byte detected - continuing negotiation\n");
-            response_byte = 0x00; // Continue with safe response
-        } else if (in == 0xFF) {
-            printf("[RP2040] Communication error: 0xFF\n");
-            response_byte = 0x00; // Safe response
-        } else if (in == SERIAL_PREAMBLE_BYTE) { // 0xFD
-            // This is the START of preamble - negotiation is complete!
-            printf("[RP2040] First preamble byte (0xFD) detected - negotiation complete!\n");
-            negotiation_complete = true;
-            break;
-        } else {
-            printf("[RP2040] Unexpected negotiation byte: 0x%02X\n", in);
-            response_byte = 0x00; // Safe default response
-        }
-        
-        // Send the response for the next iteration (if not complete)
-        if (!negotiation_complete && negotiation_attempts < max_negotiation_attempts - 1) {
-            gb_link_xfer_byte(response_byte);
-        }
-        
-        negotiation_attempts++;
-        sleep_ms(25); // Shorter delay for responsiveness
-    }
-    
-    if (!negotiation_complete) {
-        printf("[RP2040] Negotiation timeout - checking for preamble anyway\n");
-    }
-    
-    // Step 4: Wait for PROPER preamble sequence (minimum 10x 0xFD as per research)
-    printf("[RP2040] Waiting for proper preamble sequence (10x 0xFD minimum)...\n");
-    int preamble_count = 0;
-    int preamble_attempts = 0;
-    const int max_preamble_attempts = 50; // Allow more time to find preamble
-    const int required_preamble_bytes = 10; // Research says "10x 0xFD preamble"
-    bool preamble_complete = false;
-    
-    // If we exited negotiation due to 0xFD, we already have our first preamble byte
-    if (negotiation_complete) {
-        preamble_count = 1;
-        printf("[RP2040] Already detected first preamble byte during negotiation\n");
-    }
-    
-    while (preamble_attempts < max_preamble_attempts && !preamble_complete) {
-        uint8_t in = gb_link_xfer_byte(SERIAL_PREAMBLE_BYTE);
-        
-        if (in == SERIAL_PREAMBLE_BYTE) { // 0xFD
-            preamble_count++;
-            printf("[RP2040] Preamble byte %d/10: 0xFD\n", preamble_count);
-            
-            if (preamble_count >= required_preamble_bytes) {
-                printf("[RP2040] Sufficient preamble received (%d bytes) - ready for random seed!\n", preamble_count);
-                preamble_complete = true;
-                break;
-            }
-        } else {
-            // Non-preamble byte - could be start of data or still connection
-            if (preamble_count >= 3) {
-                // If we've seen some preamble, this might be data starting
-                printf("[RP2040] Partial preamble (%d bytes), non-preamble 0x%02X - assuming data start\n", preamble_count, in);
-                preamble_complete = true;
-                
-                // This byte might be first random seed byte - handle it appropriately
-                if (in == 0x60) {
-                    printf("[RP2040] First data byte is 0x60 - still connection phase, continuing\n");
-                } else {
-                    printf("[RP2040] First data byte is 0x%02X - actual random data\n", in);
-                }
-                break;
-            } else {
-                // Still in connection phase
-                printf("[RP2040] Connection byte 0x%02X during preamble search (attempt %d)\n", in, preamble_attempts);
-                if (in == 0x60) {
-                    // Still connection confirmation
-                    preamble_count = 0; // Reset counter
-                } else if (in == 0x00 || in == 0xD0) {
-                    // Still negotiation
-                    preamble_count = 0;
-                }
-            }
-        }
-        
-        preamble_attempts++;
-        sleep_ms(15);
-    }
-    
-    if (!preamble_complete) {
-        printf("[RP2040] Preamble timeout - proceeding with data exchange anyway\n");
-    }
-    
-    // Step 5: Exchange random seed (variable length) - detect transition to trade data
-    printf("[RP2040] Exchanging random seed data...\n");
-    const uint8_t random_response[TRADE_RANDOM_LEN] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A};
-    bool trade_data_detected = false;
-    int random_bytes_exchanged = 0;
-    
-    for (int i = 0; i < TRADE_RANDOM_LEN; ++i) {
-        uint8_t in = gb_link_xfer_byte(random_response[i]);
-        printf("[RP2040] Random seed byte %d: sent 0x%02X, received 0x%02X\n", i, random_response[i], in);
-        random_bytes_exchanged++;
-        
-        // Detect when Game Boy starts sending actual trade data
-        if (i >= 3) { // Only check after first few bytes
-            // Look for patterns that indicate trade data has started
-            if (in == 0x01 || in == 0x02 || in == 0x03 || in == 0x04 || in == 0x05 || in == 0x06) {
-                // Possible party count (1-6 Pokemon) - this could be start of trade data
-                printf("[RP2040] Possible party count detected (0x%02X) - trade data may be starting\n", in);
-                
-                // Check if this looks like a valid party count by examining next byte
-                uint8_t next_in = gb_link_xfer_byte(random_response[i+1 < TRADE_RANDOM_LEN ? i+1 : 0]);
-                i++; // Consume the next byte
-                random_bytes_exchanged++;
-                printf("[RP2040] Next byte after party count: 0x%02X\n", next_in);
-                
-                // If next byte is a valid species (0x01-0xFF except 0x00), likely trade data
-                if (next_in >= 0x01 && next_in <= 0xFF && next_in != 0x00) {
-                    printf("[RP2040] Valid species detected (0x%02X) - trade data confirmed!\n", next_in);
-                    trade_data_detected = true;
-                    
-                    // We need to start trade block exchange with these two bytes we already read
-                    printf("[RP2040] Starting trade block with pre-read bytes: 0x%02X 0x%02X\n", in, next_in);
-                    break;
-                }
-            } else if (in >= 0x70 && in <= 0xFF && i >= 5) {
-                // High values later in sequence often indicate transition to trade data
-                printf("[RP2040] High value (0x%02X) detected at position %d - possible trade data\n", in, i);
-                // Continue for now but flag as potential transition
-            }
-        }
-        
-        // Traditional checks
-        if (in == 0x60 && i == 0) {
-            printf("[RP2040] Warning: Game Boy still sending connection bytes (0x60) instead of random seed\n");
-        } else if (in == 0xFD) {
-            printf("[RP2040] Game Boy sending preamble (0xFD) during random seed - protocol mismatch\n");
-        }
-    }
-    
-    if (trade_data_detected) {
-        printf("[RP2040] Trade data transition detected after %d random bytes\n", random_bytes_exchanged);
-    } else {
-        printf("[RP2040] Random seed exchange completed normally (%d bytes)\n", random_bytes_exchanged);
-    }
-    
-    // Step 6: Exchange trade block (404 bytes)
-    printf("[RP2040] Exchanging trade block...\n");
-    printf("[RP2040] Sending Pokémon - Party Count: 0x%02X, Species: 0x%02X, Level: %d\n", 
-           stored_pokemon[0], stored_pokemon[8], stored_pokemon[11]);
-    
-    // Debug: Show first 20 bytes of what we're sending
-    printf("[RP2040] First 20 bytes being sent: ");
-    for (int i = 0; i < 20; i++) {
-        printf("0x%02X ", stored_pokemon[i]);
-    }
-    printf("\n");
-    
-    // Debug: Show trainer name (first OT name at offset 272-282)
-    printf("[RP2040] Trainer name: ");
-    for (int i = 272; i < 283; i++) {
-        if (stored_pokemon[i] == 0x50) {
-            printf("[END] ");
-            break;
-        } else {
-            printf("0x%02X ", stored_pokemon[i]);
-        }
-    }
-    printf("\n");
-    
-    uint8_t incoming_pokemon[TRADE_BLOCK_LEN] = {0};
-    
-    // If we detected trade data early, we need to properly handle the offset
-    if (trade_data_detected && random_bytes_exchanged < TRADE_RANDOM_LEN) {
-        printf("[RP2040] Trade data detected early - first 2 bytes already read\n");
-        // We already have the first 2 bytes from our detection
-        // The last 2 random bytes we read are actually the first 2 trade bytes
-        incoming_pokemon[0] = 0x01; // We know the party count from detection
-        incoming_pokemon[1] = 0x05; // We know the species from detection
-        
-        // Continue with the rest of the trade block
-        for (int i = 2; i < TRADE_BLOCK_LEN; ++i) {
-            uint8_t in = gb_link_xfer_byte(stored_pokemon[i]);
-            incoming_pokemon[i] = in;
-            if (i % 50 == 0) {
-                printf("[RP2040] Trade block progress: %d/404\n", i);
+            if (bit_count >= 8) {
+                // Byte complete
+                last_received = shift_register;
+                transfer_complete = true;
+                bit_count = 0;
+                shift_register = 0;
             }
         }
     } else {
-        // Normal trade block exchange - no offset issues
-        for (int i = 0; i < TRADE_BLOCK_LEN; ++i) {
-            uint8_t in = gb_link_xfer_byte(stored_pokemon[i]);
-            incoming_pokemon[i] = in;
-            if (i % 50 == 0) {
-                printf("[RP2040] Trade block progress: %d/404\n", i);
-            }
-        }
-    }
-    
-    // Log received Pokémon data for debugging
-    printf("[RP2040] Trade block exchanged.\n");
-    printf("[RP2040] Received - Party count: 0x%02X, Species: 0x%02X, Level: %d\n", 
-           incoming_pokemon[0], incoming_pokemon[8], incoming_pokemon[11]);
-    
-    // Debug: Show first 20 bytes of what we received
-    printf("[RP2040] First 20 bytes received: ");
-    for (int i = 0; i < 20; i++) {
-        printf("0x%02X ", incoming_pokemon[i]);
-    }
-    printf("\n");
-    
-    // Step 7: Send end bytes (3 bytes)
-    printf("[RP2040] Sending end bytes...\n");
-    const uint8_t end_bytes[TRADE_END_LEN] = TRADE_END_BYTES;
-    for (int i = 0; i < TRADE_END_LEN; ++i) {
-        gb_link_xfer_byte(end_bytes[i]);
-    }
-    
-    // Step 8: Send post-trade preamble (3x 0xFD)
-    for (int i = 0; i < TRADE_POST_PREAMBLE_LEN; ++i) {
-        gb_link_xfer_byte(SERIAL_PREAMBLE_BYTE);
-    }
-    printf("[RP2040] End of trade block.\n");
-    
-    // Step 9: Patch list exchange (bidirectional - receive Game Boy's, then send ours)
-    printf("[RP2040] Exchanging patch lists...\n");
-    
-    // First, receive the Game Boy's patch list
-    printf("[RP2040] Receiving Game Boy's patch list...\n");
-    uint8_t gb_patch_list[PATCH_LIST_HEADER_LEN + PATCH_LIST_BLANK_LEN + PATCH_LIST_DATA_LEN];
-    
-    // Receive preamble bytes
-    for (int i = 0; i < PATCH_LIST_HEADER_LEN; ++i) {
-        uint8_t in = gb_link_xfer_byte(SERIAL_PREAMBLE_BYTE);
-        gb_patch_list[i] = in;
-        printf("[RP2040] GB patch preamble byte %d: 0x%02X\n", i, in);
-    }
-    
-    // Receive patch list data  
-    for (int i = 0; i < PATCH_LIST_BLANK_LEN + PATCH_LIST_DATA_LEN; ++i) {
-        uint8_t in = gb_link_xfer_byte(0x00); // Safe default response
-        gb_patch_list[PATCH_LIST_HEADER_LEN + i] = in;
-        if (i < 10) { // Only log first few bytes
-            printf("[RP2040] GB patch data byte %d: 0x%02X\n", i, in);
-        }
-    }
-    printf("[RP2040] Game Boy patch list received.\n");
-    
-    // Now send our patch list
-    printf("[RP2040] Sending our patch list...\n");
-    // Send preamble
-    for (int i = 0; i < PATCH_LIST_HEADER_LEN; ++i) {
-        gb_link_xfer_byte(SERIAL_PREAMBLE_BYTE);
-    }
-    // Send empty patch list: 0xFF 0xFF (no patches needed) followed by zeros
-    gb_link_xfer_byte(0xFF); // First patch list terminator
-    gb_link_xfer_byte(0xFF); // Second patch list terminator  
-    for (int i = 2; i < PATCH_LIST_BLANK_LEN + PATCH_LIST_DATA_LEN; ++i) {
-        gb_link_xfer_byte(0x00);
-    }
-    printf("[RP2040] Patch list exchange completed.\n");
-    
-    // Step 10: Pokemon selection and confirmation protocol  
-    printf("[RP2040] Starting Pokemon selection protocol...\n");
-    
-    // Handle the actual Pokemon selection phase - this should be much more selective
-    int selection_attempts = 0;
-    const int max_selection_attempts = 200; // Increased attempts for proper selection
-    bool selection_complete = false;
-    bool pokemon_selected = false;
-    int pokemon_selection_confirmations = 0;
-    
-    // Handle the actual Pokemon selection sequence
-    while (selection_attempts < max_selection_attempts && !selection_complete) {
-        uint8_t response = 0x60; // Default: select Pokemon 1
-        uint8_t in = gb_link_xfer_byte(response);
-        
-        if (selection_attempts % 20 == 0) {
-            printf("[RP2040] Selection attempt %d: received 0x%02X\n", selection_attempts, in);
-        }
-        
-        // Handle the actual Game Boy Pokemon selection protocol
-        if (in >= 0x60 && in <= 0x65) {
-            // Pokemon selection bytes (0x60-0x65 for Pokemon 1-6)
-            printf("[RP2040] Game Boy selected Pokemon %d (0x%02X)\n", in - 0x60 + 1, in);
-            response = 0x60; // Always respond with Pokemon 1 selection
-            pokemon_selected = true;
-            pokemon_selection_confirmations++;
-            
-            // Only complete after multiple consistent selections
-            if (pokemon_selection_confirmations >= 5) {
-                printf("[RP2040] Pokemon selection confirmed after %d confirmations\n", pokemon_selection_confirmations);
-                
-                // Look for acceptance confirmation
-                uint8_t confirm_in = gb_link_xfer_byte(0x60);
-                if (confirm_in == 0x62 || confirm_in == 0x60) {
-                    printf("[RP2040] Trade acceptance confirmed (0x%02X)\n", confirm_in);
-                    selection_complete = true;
-                    break;
-                } else {
-                    printf("[RP2040] Waiting for trade acceptance, got 0x%02X\n", confirm_in);
-                }
-            }
-        } else if (in == 0x61) {
-            // Trade rejected
-            printf("[RP2040] Trade rejected by Game Boy\n");
-            response = 0x60; // Try again with Pokemon 1
-            pokemon_selection_confirmations = 0; // Reset confirmations
-        } else if (in == 0x62) {
-            // Trade accepted - this means success!
-            printf("[RP2040] Trade explicitly accepted! Selection complete.\n");
-            selection_complete = true;
-            break;
-        } else if (in == SERIAL_PREAMBLE_BYTE) { // 0xFD
-            // Preamble bytes during selection - just echo back
-            printf("[RP2040] Preamble during selection\n");
-            response = SERIAL_PREAMBLE_BYTE;
-        } else if (in == 0x00) {
-            // Blank bytes - could be end of selection or just pause
-            response = 0x00;
-            // Only consider complete if we've had Pokemon selections first
-            if (pokemon_selected && pokemon_selection_confirmations >= 3) {
-                static int completion_count = 0;
-                completion_count++;
-                if (completion_count >= 3) {
-                    printf("[RP2040] Multiple completion bytes after Pokemon selection - trade complete\n");
-                    selection_complete = true;
-                    break;
-                }
-            }
+        // Falling edge - send data to Game Boy
+        if (output_bit_pos >= 0 && output_bit_pos < 8) {
+            gpio_put(GB_SI_PIN, (output_byte >> output_bit_pos) & 1);
+            output_bit_pos--;
         } else {
-            // Unknown byte - don't assume completion too quickly
-            if (selection_attempts % 20 == 0) {
-                printf("[RP2040] Unknown selection byte: 0x%02X, continuing with default\n", in);
-            }
-            response = 0x60; // Always try to select Pokemon 1
+            gpio_put(GB_SI_PIN, 1); // Default high
         }
-        
-        selection_attempts++;
-        sleep_ms(20); // Shorter delay for responsiveness
     }
-    
-    if (selection_complete) {
-        printf("[RP2040] Trade protocol completed successfully!\n");
-    } else {
-        printf("[RP2040] Selection timeout after %d attempts\n", selection_attempts);
-        printf("[RP2040] Trade data was exchanged successfully - finalizing trade\n");
-    }
-    
-    // Step 11: Final trade completion acknowledgment
-    printf("[RP2040] Sending final trade completion acknowledgment...\n");
-    
-    // Send final ACK sequence to confirm trade completion
-    for (int i = 0; i < 10; i++) {
-        uint8_t in = gb_link_xfer_byte(0x62); // Trade completion ACK
-        printf("[RP2040] Final ACK %d: sent 0x62, received 0x%02X\n", i, in);
-        
-        // If Game Boy sends 0x00, it has completed the trade - send final ACK and stop
-        if (in == 0x00) {
-            printf("[RP2040] Game Boy sent completion signal (0x00) - sending final confirmation\n");
-            
-            // Send one final acknowledgment to confirm we received the completion signal
-            uint8_t final_in = gb_link_xfer_byte(0x00);
-            printf("[RP2040] Final confirmation: sent 0x00, received 0x%02X\n", final_in);
-            
-            // Give Game Boy a moment to finalize the trade animation
-            sleep_ms(200);
-            printf("[RP2040] Trade protocol complete!\n");
-            break;
-        }
-        // If Game Boy stops responding or sends other completion signals
-        else if (in == 0xFF || in == 0x62) {
-            printf("[RP2040] Game Boy acknowledged trade completion (0x%02X)\n", in);
-            break;
-        }
-        sleep_ms(100); // Give Game Boy time to process
-    }
-    
-    printf("[RP2040] Final acknowledgment sequence completed\n");
-    
-    // Store the incoming Pokémon since we did successfully exchange data
-    memcpy(stored_pokemon, incoming_pokemon, TRADE_BLOCK_LEN);
-    
-    // Update our Pokemon data for future trades
-    init_pokemon_data();
-    
-    printf("[RP2040] Trade completed - Pokemon data updated\n");
-    printf("[RP2040] ==> TRADE SUCCESSFUL! <==\n");
-    
-    // Step 12: Post-trade cleanup phase
-    // Continue responding to Game Boy until it naturally stops communicating
-    printf("[RP2040] Entering post-trade cleanup phase...\n");
+}
+
+// Function to set the next byte to send
+void gb_link_set_output_byte(uint8_t byte) {
+    output_byte = byte;
+    output_bit_pos = 7;
+}
+
+// Post-trade cleanup function
+void gb_link_post_trade_cleanup(void) {
+    printf("Entering post-trade cleanup phase...\n");
     
     int cleanup_attempts = 0;
-    const int max_cleanup_attempts = 500; // Allow up to 500 response cycles (for 36+ second animation)
+    const int max_cleanup_attempts = 500; // Allow up to 500 response cycles
     int consecutive_timeouts = 0;
-    const int max_consecutive_timeouts = 50; // Stop after 50 consecutive timeouts (allow 50+ seconds for full animation)
+    const int max_consecutive_timeouts = 50; // Stop after 50 consecutive timeouts
     bool communication_ended = false;
     
     while (cleanup_attempts < max_cleanup_attempts && !communication_ended) {
-        // Try to exchange a byte with short timeout to detect ongoing communication
-        // We'll modify gb_link_xfer_byte to have a timeout, or implement a timeout version here
+        uint64_t start_time = time_us_64();
+        bool timeout = false;
         
-        // Check for clock activity by trying to receive with timeout
-        uint32_t start_time = time_us_32();
-        const uint32_t first_bit_timeout_us = 1000000; // 1000ms (1 second) timeout for first bit
-        bool communication_detected = false;
-        
-        // Wait for clock falling edge to detect communication start
-        while ((time_us_32() - start_time) < first_bit_timeout_us) {
-            if (!gpio_get(GB_SC_PIN)) { // Clock gone low - communication starting
-                communication_detected = true;
-                break;
-            }
-            sleep_us(1000); // 1ms polling interval
+        // Wait for incoming data with timeout
+        while (!transfer_complete && (time_us_64() - start_time) < 1000000) { // 1 second timeout
+            sleep_ms(1);
         }
         
-        if (!communication_detected) {
+        if (!transfer_complete) {
             consecutive_timeouts++;
-            printf("[RP2040] No communication detected (timeout %d/%d)\n", consecutive_timeouts, max_consecutive_timeouts);
+            printf("Cleanup timeout %d (attempt %d)\n", consecutive_timeouts, cleanup_attempts);
             
             if (consecutive_timeouts >= max_consecutive_timeouts) {
-                printf("[RP2040] Multiple consecutive timeouts - ending cleanup\n");
-                communication_ended = true;
+                printf("Too many consecutive timeouts - ending cleanup\n");
                 break;
             }
-            
-            cleanup_attempts++;
-            continue;
+            timeout = true;
+        } else {
+            consecutive_timeouts = 0; // Reset timeout counter
         }
         
-        // Communication detected, reset timeout counter and exchange byte
-        consecutive_timeouts = 0;
-        uint8_t in = gb_link_xfer_byte(0x62); // Continue responding with ACK
+        uint8_t in = timeout ? 0x00 : last_received;
+        transfer_complete = false;
         
-        if (cleanup_attempts < 10 || cleanup_attempts % 10 == 0) {
-            printf("[RP2040] Post-trade response %d: sent 0x62, received 0x%02X\n", cleanup_attempts, in);
+        // Send cleanup response
+        gb_link_set_output_byte(0x62);
+        
+        if (!timeout) {
+            printf("Post-trade response %d: sent 0x62, received 0x%02X\n", cleanup_attempts, in);
         }
         
         // Log potential end signals but don't terminate - let timeout handle the end
         if (in == 0x00) {
-            printf("[RP2040] Game Boy sent 0x00 (potential intermediate signal) - continuing cleanup\n");
+            printf("Game Boy sent 0x00 (potential intermediate signal) - continuing cleanup\n");
         } else if (in == 0xFF) {
-            printf("[RP2040] Game Boy sent 0xFF (potential error signal) - continuing cleanup\n");
+            printf("Game Boy sent 0xFF (potential error signal) - continuing cleanup\n");
         }
         
         cleanup_attempts++;
-        sleep_ms(10); // Shorter delay for responsiveness
+        sleep_ms(50); // Small delay between cleanup attempts
     }
     
-    if (cleanup_attempts >= max_cleanup_attempts) {
-        printf("[RP2040] Cleanup timeout after %d attempts - forcing end\n", cleanup_attempts);
-    }
-    
-    printf("[RP2040] Post-trade cleanup completed after %d responses\n", cleanup_attempts);
+    printf("Post-trade cleanup completed after %d responses\n", cleanup_attempts);
     
     // Final delay to ensure Game Boy has finished all processing
-    sleep_ms(3000); // Longer delay to ensure Game Boy fully completes all sequences
+    sleep_ms(3000);
     
-    printf("[RP2040] Trade session fully completed - ready for new connections\n");
-} 
+    printf("Trade session fully completed - ready for new connections\n");
+}
+
+void gb_link_set_selected_pokemon_slot(uint8_t slot) {
+    selected_pokemon_slot = slot;
+}
+
+uint8_t gb_link_get_selected_pokemon_slot(void) {
+    return selected_pokemon_slot;
+}
+
+bool gb_link_init(void) {
+    // Initialize GPIO pins
+    gpio_init(GB_CLK_PIN);
+    gpio_set_dir(GB_CLK_PIN, GPIO_IN);
+    gpio_pull_up(GB_CLK_PIN);  // Pull-up to prevent floating
+    
+    gpio_init(GB_SO_PIN);
+    gpio_set_dir(GB_SO_PIN, GPIO_IN);
+    gpio_pull_up(GB_SO_PIN);   // Pull-up to prevent floating
+    
+    gpio_init(GB_SI_PIN);
+    gpio_set_dir(GB_SI_PIN, GPIO_OUT);
+    gpio_put(GB_SI_PIN, 1);    // Default high
+    
+    // Initialize protocol state
+    current_state = TRADE_STATE_NOT_CONNECTED;
+    gameboy_status = GAMEBOY_CONN_FALSE;
+    trade_centre_state = TRADE_RESET;
+    
+    // Initialize transfer state
+    transfer_complete = false;
+    bit_count = 0;
+    shift_register = 0;
+    last_received = 0x00;
+    
+    // Initialize output state
+    output_byte = PKMN_BLANK;
+    output_bit_pos = 7;
+    
+    // Initialize timing variables to prevent false connections
+    last_bit_time = 0;
+    last_byte_time = 0;
+    
+    // Set up interrupt on clock pin
+    gpio_set_irq_enabled_with_callback(GB_CLK_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, 
+                                       true, &gb_clock_isr);
+    
+    printf("Game Boy link initialized on pins: CLK=%d, SO=%d, SI=%d\n", 
+           GB_CLK_PIN, GB_SO_PIN, GB_SI_PIN);
+    return true;
+}
+
+void gb_link_deinit(void) {
+    gpio_set_irq_enabled(GB_CLK_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+    
+    gpio_deinit(GB_CLK_PIN);
+    gpio_deinit(GB_SO_PIN);
+    gpio_deinit(GB_SI_PIN);
+    
+    current_state = TRADE_STATE_NOT_CONNECTED;
+}
+
+uint8_t gb_link_transfer_byte(uint8_t send_byte) {
+    // Just set the byte we want to send - the interrupt handler will send it
+    gb_link_set_output_byte(send_byte);
+    return last_received;
+}
+
+bool gb_link_wait_for_connection(void) {
+    // Check for recent clock activity indicating a Game Boy connection
+    uint64_t current_time = time_us_64();
+    
+    // If we've seen recent clock activity, check if it looks like a connection attempt
+    if ((current_time - last_bit_time) < 500000) { // 500ms window
+        // Look for PKMN_MASTER bytes which indicate the Game Boy is trying to connect
+        if (last_received == PKMN_MASTER) {
+            printf("Game Boy connection detected (MASTER byte received)\n");
+            current_state = TRADE_STATE_CONNECTED;
+            // DON'T set gameboy_status yet - let the protocol handler do it
+            return true;
+        }
+        
+        // Also check for CONNECTED bytes
+        if (last_received == PKMN_CONNECTED || last_received == PKMN_CONNECTED_II) {
+            printf("Game Boy connection confirmed\n");
+            current_state = TRADE_STATE_CONNECTED;
+            gameboy_status = GAMEBOY_CONN_TRUE;
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+gb_trade_state_t gb_link_get_state(void) {
+    return current_state;
+}
+
+void gb_link_set_state(gb_trade_state_t state) {
+    current_state = state;
+}
+
+// Helper functions for protocol responses
+static uint8_t get_connect_response(uint8_t in_data) {
+    uint8_t ret = in_data;
+    
+    switch(in_data) {
+        case PKMN_CONNECTED:
+        case PKMN_CONNECTED_II:
+            gameboy_status = GAMEBOY_CONN_TRUE;
+            ret = in_data; // Echo back the connected byte
+            printf("Connection confirmed with byte 0x%02X\n", in_data);
+            break;
+        case PKMN_MASTER:
+            ret = PKMN_SLAVE; // Respond as slave
+            // Stay in GAMEBOY_CONN_FALSE until we get CONNECTED bytes
+            printf("Game Boy is master, we are slave - waiting for connection confirmation\n");
+            break;
+        case PKMN_BLANK:
+            ret = PKMN_BLANK;
+            break;
+        default:
+            // Don't immediately break link, just echo back unknown bytes
+            ret = in_data;
+            break;
+    }
+    
+    return ret;
+}
+
+static uint8_t get_menu_response(uint8_t in_data) {
+    uint8_t response = PKMN_BLANK;
+    
+    // Count all menu interactions after trade center confirmation
+    if (trade_center_confirmed) {
+        negotiation_attempts++;
+    }
+    
+    switch(in_data) {
+        case PKMN_CONNECTED:
+        case PKMN_CONNECTED_II:
+            printf("Connection status byte (0x%02X) during menu\n", in_data);
+            response = in_data; // Echo back
+            break;
+        case ITEM_1_SELECTED: // Trade Centre selected
+            if (trade_center_confirmed) {
+                // If we've already confirmed once, try different responses to advance
+                if (negotiation_attempts > 2) {
+                    printf("Extended D4 sequence - trying 0x00 to advance (attempt %d)\n", negotiation_attempts);
+                    response = 0x00;
+                    gameboy_status = GAMEBOY_READY;
+                    current_state = TRADE_STATE_READY;
+                    trade_centre_state = TRADE_RESET;
+                } else {
+                    printf("Trade Center re-confirmed! Responding with 0xD4 (attempt %d)\n", negotiation_attempts);
+                    response = in_data; // Echo back
+                }
+            } else {
+                printf("Trade Centre selected - initial confirmation\n");
+                response = in_data; // Echo back
+                trade_center_confirmed = true;
+                negotiation_start_time = time_us_64(); // Start negotiation timer
+            }
+            break;
+        case ITEM_2_SELECTED: // Colosseum selected
+            gameboy_status = GAMEBOY_COLOSSEUM;
+            response = in_data; // Echo back
+            break;
+        case ITEM_3_SELECTED: // Break Link selected
+        case PKMN_MASTER:
+            gameboy_status = GAMEBOY_CONN_FALSE;
+            current_state = TRADE_STATE_NOT_CONNECTED;
+            response = ITEM_3_SELECTED;
+            // Reset negotiation state
+            trade_center_confirmed = false;
+            negotiation_attempts = 0;
+            break;
+        case PKMN_BLANK:
+            if (trade_center_confirmed && negotiation_attempts > 2) {
+                printf("Blank negotiation after trade center selection - responding with 0xD0 (attempt %d)\n", negotiation_attempts);
+                response = 0xD0;
+                // After several 0xD0 responses, try to advance
+                if (negotiation_attempts > 4) {
+                    printf("Extended blank negotiation - trying to advance to trade protocol\n");
+                    gameboy_status = GAMEBOY_READY;
+                    current_state = TRADE_STATE_READY;
+                    trade_centre_state = TRADE_RESET;
+                }
+            } else {
+                printf("Blank byte during early negotiation - echoing back\n");
+                response = in_data;
+            }
+            break;
+        default:
+            printf("Unknown menu byte: 0x%02X\n", in_data);
+            response = in_data;
+            break;
+    }
+    
+    return response;
+}
+
+static uint8_t get_trade_centre_response(uint8_t in_data, uint8_t* pokemon_data) {
+    uint8_t send = in_data;
+    
+    switch(trade_centre_state) {
+        case TRADE_RESET:
+            // Reset counters and static variables
+            trade_data_counter = 0;
+            patch_pt_2 = false;
+            trade_centre_state = TRADE_INIT;
+            break;
+            
+        case TRADE_INIT:
+            trade_init_attempts++;
+            
+            // If we've been stuck in TRADE_INIT for too long, just skip ahead to data exchange
+            if (trade_init_attempts > 50) {
+                printf("TRADE_INIT: Stuck for %d attempts, forcing advance to TRADE_DATA for Pokemon reception\n", trade_init_attempts);
+                trade_centre_state = TRADE_DATA;
+                trade_data_counter = 0;
+                trade_init_attempts = 0;
+                gameboy_status = GAMEBOY_WAITING;
+                send = in_data; // Echo whatever they sent
+                break;
+            }
+            
+            if(in_data == SERIAL_PREAMBLE_BYTE) {
+                trade_data_counter++;
+                consecutive_ff_count = 0; // Reset FF counter
+                gameboy_status = GAMEBOY_WAITING;
+                printf("TRADE_INIT: Received preamble %d/%d (attempt %d)\n", trade_data_counter, SERIAL_RNS_LENGTH, trade_init_attempts);
+            } else if (in_data == 0xFF) {
+                consecutive_ff_count++;
+                printf("TRADE_INIT: Received 0xFF #%d (attempt %d)\n", consecutive_ff_count, trade_init_attempts);
+                
+                // Try different responses based on how many 0xFF we've seen
+                if (consecutive_ff_count < 10) {
+                    // First few: respond with preamble
+                    send = SERIAL_PREAMBLE_BYTE;
+                    printf("TRADE_INIT: Responding with preamble (0xFD)\n");
+                } else if (consecutive_ff_count < 20) {
+                    // If preamble isn't working, try echoing back
+                    send = 0xFF;
+                    printf("TRADE_INIT: Echoing 0xFF back\n");
+                } else {
+                    // After many attempts, force advance
+                    printf("TRADE_INIT: Too many 0xFF bytes, forcing advance to TRADE_DATA\n");
+                    trade_centre_state = TRADE_DATA;
+                    trade_data_counter = 0;
+                    consecutive_ff_count = 0;
+                    trade_init_attempts = 0;
+                    send = 0xFF;
+                }
+                gameboy_status = GAMEBOY_WAITING;
+            } else if (in_data == PKMN_BLANK) {
+                // Sometimes Game Boy sends blank bytes during init
+                consecutive_ff_count = 0; // Reset FF counter
+                trade_data_counter++; // Count blank bytes as progress too
+                printf("TRADE_INIT: Received blank byte, counting as progress %d/%d (attempt %d)\n", trade_data_counter, SERIAL_RNS_LENGTH, trade_init_attempts);
+                send = PKMN_BLANK;
+            } else {
+                // For any other byte, just count it as progress - Game Boy might be trying to advance
+                trade_data_counter++;
+                printf("TRADE_INIT: Unexpected byte 0x%02X, counting as progress %d/%d (attempt %d)\n", in_data, trade_data_counter, SERIAL_RNS_LENGTH, trade_init_attempts);
+                send = in_data; // Echo back
+            }
+            
+            if(trade_data_counter >= SERIAL_RNS_LENGTH) {
+                trade_centre_state = TRADE_RANDOM;
+                trade_data_counter = 0;
+                trade_init_attempts = 0;
+                printf("TRADE_INIT complete, advancing to TRADE_RANDOM\n");
+            }
+            break;
+            
+        case TRADE_RANDOM:
+            trade_data_counter++;
+            if(trade_data_counter == (SERIAL_RNS_LENGTH + SERIAL_TRADE_PREAMBLE_LENGTH)) {
+                trade_centre_state = TRADE_DATA;
+                trade_data_counter = 0;
+            }
+            break;
+            
+        case TRADE_DATA:
+            // Exchange trade block data using party format (404 bytes)
+            if (trade_data_counter >= PARTY_DATA_SIZE) {
+                printf("ERROR: Party data overflow, resetting trade\n");
+                trade_centre_state = TRADE_RESET;
+                break;
+            }
+            
+            received_pokemon_data[trade_data_counter] = in_data;
+            
+            // Send party data instead of individual Pokemon data
+            send = party_buffer[trade_data_counter];
+            trade_data_counter++;
+            
+            if(trade_data_counter == PARTY_DATA_SIZE) {
+                trade_centre_state = TRADE_PATCH_HEADER;
+                trade_data_counter = 0;
+                printf("Party data exchange complete (%d bytes)\n", PARTY_DATA_SIZE);
+            }
+            break;
+            
+        case TRADE_PATCH_HEADER:
+            if(in_data == SERIAL_PREAMBLE_BYTE) {
+                trade_data_counter++;
+            }
+            
+            if(trade_data_counter == 6) {
+                trade_data_counter = 0;
+                trade_centre_state = TRADE_PATCH_DATA;
+            }
+            break;
+            
+        case TRADE_PATCH_DATA:
+            trade_data_counter++;
+            // Send blank bytes for patch list (simplified)
+            if(trade_data_counter > 8) {
+                send = PKMN_BLANK;
+            }
+            
+            // Handle received patch data (simplified)
+            switch(in_data) {
+                case PKMN_BLANK:
+                    break;
+                case SERIAL_PATCH_LIST_PART_TERMINATOR:
+                    patch_pt_2 = true;
+                    break;
+                default:
+                    // Apply patches to received party data with bounds checking
+                    if(!patch_pt_2 && in_data > 0 && (in_data - 1) < PARTY_DATA_SIZE) {
+                        // Only allow patches to non-critical party fields
+                        uint16_t patch_offset = in_data - 1;
+                        // Avoid patching party count, species list, or core Pokemon data
+                        if (patch_offset >= 50) { // Skip critical party structure fields
+                            received_pokemon_data[patch_offset] = SERIAL_NO_DATA_BYTE;
+                        }
+                    }
+                    break;
+            }
+            
+            if(trade_data_counter == 196) {
+                trade_centre_state = TRADE_SELECT;
+                trade_data_counter = 0;
+            }
+            break;
+            
+        case TRADE_SELECT:
+            in_pkmn_idx = 0;
+            if(in_data == PKMN_BLANK) {
+                trade_centre_state = TRADE_PENDING;
+            }
+            break;
+            
+        case TRADE_PENDING:
+            if(in_data == PKMN_TABLE_LEAVE_GEN_I) {
+                trade_centre_state = TRADE_RESET;
+                send = PKMN_TABLE_LEAVE_GEN_I;
+                gameboy_status = GAMEBOY_READY;
+            } else if((in_data & PKMN_SEL_NUM_MASK_GEN_I) == PKMN_SEL_NUM_MASK_GEN_I) {
+                in_pkmn_idx = in_data;
+                // Send our selected Pokemon slot instead of always slot 1
+                send = PKMN_SEL_NUM_MASK_GEN_I | (selected_pokemon_slot & 0x0F);
+                gameboy_status = GAMEBOY_TRADE_PENDING;
+            } else if(in_data == PKMN_BLANK && in_pkmn_idx != 0) {
+                send = 0;
+                trade_centre_state = TRADE_CONFIRMATION;
+                in_pkmn_idx &= 0x0F;
+            }
+            break;
+            
+        case TRADE_CONFIRMATION:
+            if(in_data == PKMN_TRADE_REJECT_GEN_I) {
+                trade_centre_state = TRADE_SELECT;
+                gameboy_status = GAMEBOY_WAITING;
+            } else if(in_data == PKMN_TRADE_ACCEPT_GEN_I) {
+                trade_centre_state = TRADE_DONE;
+                send = PKMN_TRADE_ACCEPT_GEN_I;
+            }
+            break;
+            
+        case TRADE_DONE:
+            if(in_data == PKMN_BLANK) {
+                printf("Pokemon trade completed! Received party data from Game Boy\n");
+                
+                // Debug the received party data
+                debug_party_data(received_pokemon_data, "RECEIVED PARTY DATA FROM GAME BOY");
+                
+                // Extract the first Pokemon from the received party data
+                static uint8_t extracted_pokemon[POKEMON_DATA_SIZE];
+                if (extract_pokemon_from_party(received_pokemon_data, 0, extracted_pokemon)) {
+                    printf("Successfully extracted Pokemon from received party\n");
+                    
+                    // Display the extracted Pokemon data
+                    extern void display_pokemon_data(const uint8_t* pokemon_data, const char* title);
+                    display_pokemon_data(extracted_pokemon, "EXTRACTED POKEMON FROM RECEIVED PARTY");
+                    
+                    // In bidirectional mode, save extracted Pokemon to designated slot
+                    if (bidirectional_mode) {
+                        extern bool storage_save_pokemon(uint8_t slot, const uint8_t* pokemon_data, size_t data_len);
+                        if (storage_save_pokemon(receive_pokemon_slot, extracted_pokemon, POKEMON_DATA_SIZE)) {
+                            printf("Received Pokemon saved to slot %d\n", receive_pokemon_slot);
+                        } else {
+                            printf("Failed to save received Pokemon to slot %d\n", receive_pokemon_slot);
+                        }
+                    } else {
+                        // Legacy mode: copy extracted data over current Pokemon buffer
+                        memcpy(pokemon_data, extracted_pokemon, POKEMON_DATA_SIZE);
+                    }
+                } else {
+                    printf("ERROR: Failed to extract Pokemon from received party data\n");
+                }
+                
+                // Mark trade as complete and trigger cleanup
+                trade_centre_state = TRADE_RESET;
+                gameboy_status = GAMEBOY_TRADING;
+                send = PKMN_BLANK; // Send blank to acknowledge completion
+            }
+            break;
+            
+        case TRADE_CANCEL:
+            if(in_data == PKMN_TABLE_LEAVE_GEN_I) {
+                trade_centre_state = TRADE_RESET;
+                gameboy_status = GAMEBOY_READY;
+            }
+            send = PKMN_TABLE_LEAVE_GEN_I;
+            break;
+            
+        default:
+            break;
+    }
+    
+    return send;
+}
+
+// Check for ISR errors and reset if needed
+bool gb_link_check_isr_health(void) {
+    if (isr_error) {
+        printf("ERROR: ISR error detected, resetting interrupt handler\n");
+        
+        // Disable interrupt
+        gpio_set_irq_enabled(GB_CLK_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+        
+        // Reset state
+        isr_error = false;
+        isr_call_count = 0;
+        transfer_complete = false;
+        bit_count = 0;
+        shift_register = 0;
+        output_bit_pos = 7;
+        
+        // Re-enable interrupt
+        gpio_set_irq_enabled_with_callback(GB_CLK_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, 
+                                           true, &gb_clock_isr);
+        
+        return false;
+    }
+    return true;
+}
+
+// Simpler continuous protocol handler that runs in the background
+void gb_link_handle_protocol_step(uint8_t* pokemon_data) {
+    // Check ISR health first
+    if (!gb_link_check_isr_health()) {
+        return;
+    }
+    
+    if (!transfer_complete) {
+        return; // No new data to process
+    }
+    
+    transfer_complete = false;
+    uint8_t response = PKMN_BLANK;
+    
+    // Safety check
+    if (pokemon_data == NULL) {
+        printf("ERROR: pokemon_data is NULL\n");
+        return;
+    }
+    
+    printf("Received: 0x%02X, Status: %d, Trade State: %d, ISR calls: %lu\n", 
+           last_received, gameboy_status, trade_centre_state, isr_call_count);
+    
+    // Reset ISR call counter periodically
+    if (isr_call_count > 1000) {
+        isr_call_count = 0;
+    }
+    
+    // Handle the received byte based on current state
+    printf("Current gameboy_status: %d\n", gameboy_status);
+    
+    switch(gameboy_status) {
+        case GAMEBOY_CONN_FALSE:
+            printf("Handling connection attempt\n");
+            response = get_connect_response(last_received);
+            printf("get_connect_response returned: 0x%02X\n", response);
+            break;
+        case GAMEBOY_CONN_TRUE:
+            printf("Handling menu selection\n");
+            response = get_menu_response(last_received);
+            
+            // Check if we should advance to trade protocol after sufficient negotiation
+            uint64_t negotiation_time = negotiation_start_time > 0 ? (time_us_64() - negotiation_start_time) : 0;
+            if (trade_center_confirmed && (negotiation_attempts > 3 || negotiation_time > 10000000)) { // 10 seconds max
+                printf("Negotiation complete - advancing to trade protocol (attempts: %d, time: %llu ms)\n", 
+                       negotiation_attempts, negotiation_time / 1000);
+                gameboy_status = GAMEBOY_READY;
+                current_state = TRADE_STATE_READY;
+                trade_centre_state = TRADE_RESET; // Make sure trade state is ready
+            }
+            break;
+        case GAMEBOY_COLOSSEUM:
+            response = last_received; // Echo back for colosseum
+            break;
+        default:
+            printf("Handling trade state: %d\n", gameboy_status);
+            
+            // Handle special bytes that might need different responses
+            if (last_received == 0x62) {
+                printf("Received cleanup byte 0x62, responding with acknowledgment\n");
+                response = 0x62; // Echo back cleanup byte
+            } else {
+                // Let the trade center response handler deal with all trade protocol bytes
+                response = get_trade_centre_response(last_received, pokemon_data);
+            }
+            break;
+    }
+    
+    // Set the response byte for the next transfer
+    gb_link_set_output_byte(response);
+    printf("Responding with: 0x%02X\n", response);
+}
+
+bool gb_link_trade_or_store(uint8_t* pokemon_data, size_t data_len) {
+    printf("Trade protocol handler active - will respond to Game Boy automatically\n");
+    
+    // Disable bidirectional mode for legacy compatibility
+    bidirectional_mode = false;
+    
+    // Convert individual Pokemon data to party format
+    if (!create_party_from_pokemon(pokemon_data, party_buffer)) {
+        printf("ERROR: Failed to create party data from Pokemon\n");
+        return false;
+    }
+    
+    // Debug the party data we created
+    debug_party_data(party_buffer, "PARTY DATA TO SEND");
+    
+    // Reset trade state and negotiation tracking
+    trade_centre_state = TRADE_RESET;
+    trade_center_confirmed = false;
+    negotiation_attempts = 0;
+    consecutive_ff_count = 0;
+    trade_init_attempts = 0;
+    trade_data_counter = 0;
+    negotiation_start_time = 0;
+    
+    // The actual protocol handling happens in the main loop via gb_link_handle_protocol_step
+    // This function just sets up and waits for completion
+    uint64_t start_time = time_us_64();
+    
+    while ((time_us_64() - start_time) < 120000000) { // 2 minute timeout
+        // Handle each protocol step as data comes in
+        gb_link_handle_protocol_step(pokemon_data);
+        
+        // Check if trade completed
+        if (gameboy_status == GAMEBOY_TRADING && trade_centre_state == TRADE_RESET) {
+            printf("Trade completed successfully! Starting post-trade cleanup...\n");
+            
+            // Run dedicated post-trade cleanup
+            gb_link_post_trade_cleanup();
+            
+            return true;
+        }
+        
+        // Check for connection loss - much longer timeout for full trade duration
+        uint64_t current_time = time_us_64();
+        
+        // Fix potential timer overflow by checking if last_bit_time is reasonable
+        if (last_bit_time == 0 || last_bit_time > current_time) {
+            last_bit_time = current_time; // Reset if invalid
+        }
+        
+        uint64_t time_since_activity = current_time - last_bit_time;
+        
+        // Debug timing every 30 seconds
+        static uint64_t last_debug_time = 0;
+        if ((current_time - last_debug_time) > 30000000) {
+            printf("Trade activity: %llu seconds since last bit (current=%llu, last=%llu)\n", 
+                   time_since_activity / 1000000, current_time / 1000000, last_bit_time / 1000000);
+            last_debug_time = current_time;
+        }
+        
+        if (time_since_activity > 300000000) { // 5 minute timeout
+            printf("No activity for %llu seconds - Game Boy may have disconnected\n", time_since_activity / 1000000);
+            current_state = TRADE_STATE_NOT_CONNECTED;
+            gameboy_status = GAMEBOY_CONN_FALSE;
+            return false;
+        }
+        
+        sleep_ms(10);
+    }
+    
+    printf("Trade protocol timeout\n");
+    return false;
+}
+
+bool gb_link_bidirectional_trade(uint8_t send_slot, uint8_t receive_slot) {
+    printf("Starting bidirectional trade: sending slot %d, receiving to slot %d\n", send_slot, receive_slot);
+    
+    // Enable bidirectional mode
+    bidirectional_mode = true;
+    selected_pokemon_slot = send_slot;
+    receive_pokemon_slot = receive_slot;
+    
+    // Load Pokemon data from the selected slot
+    uint8_t send_pokemon_data[POKEMON_DATA_SIZE];
+    size_t data_len;
+    
+    extern bool storage_load_pokemon(uint8_t slot, uint8_t* pokemon_data, size_t* data_len);
+    if (!storage_load_pokemon(send_slot, send_pokemon_data, &data_len)) {
+        printf("Failed to load Pokemon from slot %d\n", send_slot);
+        bidirectional_mode = false;
+        return false;
+    }
+    
+    printf("Loaded Pokemon from slot %d for trading\n", send_slot);
+    extern void display_pokemon_data(const uint8_t* pokemon_data, const char* title);
+    display_pokemon_data(send_pokemon_data, "POKEMON TO SEND");
+    
+    // Convert individual Pokemon data to party format
+    if (!create_party_from_pokemon(send_pokemon_data, party_buffer)) {
+        printf("ERROR: Failed to create party data from Pokemon\n");
+        bidirectional_mode = false;
+        return false;
+    }
+    
+    // Debug the party data we created
+    debug_party_data(party_buffer, "PARTY DATA TO SEND (BIDIRECTIONAL)");
+    
+    // Reset trade state and negotiation tracking
+    trade_centre_state = TRADE_RESET;
+    trade_center_confirmed = false;
+    negotiation_attempts = 0;
+    consecutive_ff_count = 0;
+    trade_init_attempts = 0;
+    trade_data_counter = 0;
+    negotiation_start_time = 0;
+    
+    uint64_t start_time = time_us_64();
+    
+    while ((time_us_64() - start_time) < 120000000) { // 2 minute timeout
+        // Handle each protocol step as data comes in
+        gb_link_handle_protocol_step(send_pokemon_data);
+        
+        // Check if trade completed
+        if (gameboy_status == GAMEBOY_TRADING && trade_centre_state == TRADE_RESET) {
+            printf("Bidirectional trade completed successfully! Starting post-trade cleanup...\n");
+            
+            // Run dedicated post-trade cleanup
+            gb_link_post_trade_cleanup();
+            
+            bidirectional_mode = false;
+            return true;
+        }
+        
+        // Check for connection loss - much longer timeout for full trade duration
+        uint64_t current_time = time_us_64();
+        
+        // Fix potential timer overflow by checking if last_bit_time is reasonable
+        if (last_bit_time == 0 || last_bit_time > current_time) {
+            last_bit_time = current_time; // Reset if invalid
+        }
+        
+        uint64_t time_since_activity = current_time - last_bit_time;
+        
+        // Debug timing every 30 seconds
+        static uint64_t last_debug_time_bi = 0;
+        if ((current_time - last_debug_time_bi) > 30000000) {
+            printf("Bidirectional trade activity: %llu seconds since last bit (current=%llu, last=%llu)\n", 
+                   time_since_activity / 1000000, current_time / 1000000, last_bit_time / 1000000);
+            last_debug_time_bi = current_time;
+        }
+        
+        if (time_since_activity > 300000000) { // 5 minute timeout
+            printf("No activity for %llu seconds - Game Boy may have disconnected\n", time_since_activity / 1000000);
+            current_state = TRADE_STATE_NOT_CONNECTED;
+            gameboy_status = GAMEBOY_CONN_FALSE;
+            bidirectional_mode = false;
+            return false;
+        }
+        
+        sleep_ms(10);
+    }
+    
+    printf("Bidirectional trade timeout\n");
+    bidirectional_mode = false;
+    return false;
+}
